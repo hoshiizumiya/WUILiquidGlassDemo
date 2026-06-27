@@ -11,7 +11,9 @@
 
     <Grid x:Name="Root"
           Background="Transparent"
-          AllowDrop="True">
+          AllowDrop="True"
+          DragOver="OnRootDragOver"
+          Drop="OnRootDrop">
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="240" />
             <ColumnDefinition Width="*" />
@@ -209,14 +211,24 @@
                     <TranslateTransform Y="138" />
                 </StackPanel.RenderTransform>
                 <Button x:Name="SetBackgroundImageButton"
+                        Click="OnSetBackgroundImageClick"
                         Content="Set background image" />
                 <Button x:Name="ClearBackgroundImageButton"
+                        Click="OnClearBackgroundImageClick"
                         Content="Clear background image" />
             </StackPanel>
         </Grid>
 
         <Canvas x:Name="BackdropHost"
-                Grid.ColumnSpan="2">
+                Grid.ColumnSpan="2"
+                Loaded="OnBackdropHostLoaded"
+                SizeChanged="OnBackdropHostSizeChanged"
+                PointerPressed="OnBackdropHostPointerPressed"
+                PointerMoved="OnBackdropHostPointerMoved"
+                PointerReleased="OnBackdropHostPointerReleased"
+                PointerCanceled="OnBackdropHostPointerCanceled"
+                PointerCaptureLost="OnBackdropHostPointerCaptureLost"
+                PointerExited="OnBackdropHostPointerExited">
             <Border x:Name="BackdropFrame"
                     Canvas.Left="268"
                     Canvas.Top="80"
@@ -224,7 +236,8 @@
                     Height="260"
                     Background="Transparent"
                     BorderBrush="#FF808080"
-                    BorderThickness="2">
+                    BorderThickness="2"
+                    PointerWheelChanged="OnBackdropFramePointerWheelChanged">
             </Border>
         </Canvas>
 
@@ -235,7 +248,8 @@
                            FontWeight="SemiBold" />
                 <ComboBox x:Name="EffectSelector"
                           SelectedIndex="0"
-                          HorizontalAlignment="Stretch">
+                          HorizontalAlignment="Stretch"
+                          SelectionChanged="OnEffectSelectionChanged">
                     <ComboBoxItem Content="Solid" />
                     <ComboBoxItem Content="Linear Gradient" />
                     <ComboBoxItem Content="Blur" />
@@ -252,7 +266,8 @@
                         Value="2"
                         StepFrequency="1"
                         TickFrequency="4"
-                        TickPlacement="BottomRight" />
+                        TickPlacement="BottomRight"
+                        ValueChanged="OnBorderWidthChanged" />
                 <StackPanel x:Name="LiquidGlassControls"
                             Margin="0,12,0,0"
                             Spacing="6">
@@ -265,49 +280,56 @@
                             Maximum="32"
                             Value="16"
                             SmallChange="0.5"
-                            StepFrequency="0.5" />
+                            StepFrequency="0.5"
+                            ValueChanged="OnGaussianBlurRadiusChanged" />
                     <TextBlock Text="Blur radius" />
                     <Slider x:Name="BlurRadiusSlider"
                             Minimum="0"
                             Maximum="16"
                             Value="0"
                             SmallChange="0.25"
-                            StepFrequency="0.25" />
+                            StepFrequency="0.25"
+                            ValueChanged="OnLiquidGlassParameterChanged" />
                     <TextBlock Text="Refraction" />
                     <Slider x:Name="RefractionStrengthSlider"
                             Minimum="0"
                             Maximum="24"
                             Value="12"
                             SmallChange="0.25"
-                            StepFrequency="0.25" />
+                            StepFrequency="0.25"
+                            ValueChanged="OnLiquidGlassParameterChanged" />
                     <TextBlock Text="Corner radius" />
                     <Slider x:Name="CornerRadiusSlider"
                             Minimum="0"
                             Maximum="96"
                             Value="36"
                             SmallChange="1"
-                            StepFrequency="1" />
+                            StepFrequency="1"
+                            ValueChanged="OnLiquidGlassParameterChanged" />
                     <TextBlock Text="Glass border" />
                     <Slider x:Name="MaterialBorderThicknessSlider"
                             Minimum="0"
                             Maximum="8"
                             Value="1.5"
                             SmallChange="0.25"
-                            StepFrequency="0.25" />
+                            StepFrequency="0.25"
+                            ValueChanged="OnLiquidGlassParameterChanged" />
                     <TextBlock Text="Highlight" />
                     <Slider x:Name="HighlightStrengthSlider"
                             Minimum="0"
                             Maximum="2"
                             Value="0.85"
                             SmallChange="0.05"
-                            StepFrequency="0.05" />
+                            StepFrequency="0.05"
+                            ValueChanged="OnLiquidGlassParameterChanged" />
                     <TextBlock Text="Dispersion" />
                     <Slider x:Name="DispersionStrengthSlider"
                             Minimum="0"
                             Maximum="8"
                             Value="1.2"
                             SmallChange="0.1"
-                            StepFrequency="0.1" />
+                            StepFrequency="0.1"
+                            ValueChanged="OnLiquidGlassParameterChanged" />
                 </StackPanel>
             </StackPanel>
         </Border>

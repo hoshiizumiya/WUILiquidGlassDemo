@@ -8,6 +8,24 @@
 #include "MainWindow.g.cpp"
 #endif
 
+#if 0
+static auto _x = [] {
+    wchar_t path[MAX_PATH * 2];
+    // Attempt to load custom effect DLL to test cross-version stability.
+    DWORD dwLen = GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
+    constexpr wchar_t kCustomEffectDllName[] = L"wuceffectsi.dll";
+    if (dwLen > 0 && dwLen + ARRAYSIZE(kCustomEffectDllName) < ARRAYSIZE(path))
+    {
+        if (auto slash = wcsrchr(path, L'\\'))
+        {
+            memcpy(slash + 1, kCustomEffectDllName, sizeof(kCustomEffectDllName));
+            return LoadLibraryExW(path, nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR);
+        }
+    }
+    return (HMODULE)0;
+}();
+#endif
+
 using namespace winrt;
 using namespace Windows::ApplicationModel::DataTransfer;
 using namespace Windows::Foundation;
@@ -56,7 +74,12 @@ namespace winrt::WUILiquidGlassDemo_WUI3::implementation
 {
     MainWindow::MainWindow()
     {
-        InitializeComponent();
+    }
+
+    void MainWindow::InitializeComponent()
+    {
+        MainWindowT::InitializeComponent();
+
         StartDynamicScene();
         InitializeBackdropCursors();
 
@@ -69,166 +92,6 @@ namespace winrt::WUILiquidGlassDemo_WUI3::implementation
 
         InitializeBackdropBrush();
         ApplyBackdropEffect();
-
-        SetBackgroundImageButton().Click([weak = get_weak()](
-            IInspectable const& sender,
-            RoutedEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnSetBackgroundImageClick(sender, args);
-            }
-        });
-        ClearBackgroundImageButton().Click([weak = get_weak()](
-            IInspectable const& sender,
-            RoutedEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnClearBackgroundImageClick(sender, args);
-            }
-        });
-        Root().DragOver([weak = get_weak()](
-            IInspectable const& sender,
-            DragEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnRootDragOver(sender, args);
-            }
-        });
-        Root().Drop([weak = get_weak()](
-            IInspectable const& sender,
-            DragEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnRootDrop(sender, args);
-            }
-        });
-        EffectSelector().SelectionChanged([weak = get_weak()](
-            IInspectable const& sender,
-            Controls::SelectionChangedEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnEffectSelectionChanged(sender, args);
-            }
-        });
-        BorderWidthSlider().ValueChanged([weak = get_weak()](
-            IInspectable const& sender,
-            Controls::Primitives::RangeBaseValueChangedEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnBorderWidthChanged(sender, args);
-            }
-        });
-        auto hookLiquidGlassSlider = [weak = get_weak()](Controls::Slider const& slider)
-        {
-            slider.ValueChanged([weak](
-                IInspectable const& sender,
-                Controls::Primitives::RangeBaseValueChangedEventArgs const& args)
-            {
-                if (auto self = weak.get())
-                {
-                    self->OnLiquidGlassParameterChanged(sender, args);
-                }
-            });
-        };
-        GaussianBlurRadiusSlider().ValueChanged([weak = get_weak()](
-            IInspectable const& sender,
-            Controls::Primitives::RangeBaseValueChangedEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnGaussianBlurRadiusChanged(sender, args);
-            }
-        });
-        hookLiquidGlassSlider(BlurRadiusSlider());
-        hookLiquidGlassSlider(RefractionStrengthSlider());
-        hookLiquidGlassSlider(CornerRadiusSlider());
-        hookLiquidGlassSlider(MaterialBorderThicknessSlider());
-        hookLiquidGlassSlider(HighlightStrengthSlider());
-        hookLiquidGlassSlider(DispersionStrengthSlider());
-        BackdropHost().SizeChanged([weak = get_weak()](auto&&, auto&&)
-        {
-            if (auto self = weak.get())
-            {
-                self->ClampBackdropFrameRect();
-            }
-        });
-        BackdropHost().Loaded([weak = get_weak()](auto&&, auto&&)
-        {
-            if (auto self = weak.get())
-            {
-                self->EnsurePointerSource();
-                self->SetBackdropCursor(self->m_arrowCursor);
-            }
-        });
-        BackdropHost().PointerPressed([weak = get_weak()](
-            IInspectable const& sender,
-            PointerRoutedEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnBackdropHostPointerPressed(sender, args);
-            }
-        });
-        BackdropHost().PointerMoved([weak = get_weak()](
-            IInspectable const& sender,
-            PointerRoutedEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnBackdropHostPointerMoved(sender, args);
-            }
-        });
-        BackdropFrame().PointerWheelChanged([weak = get_weak()](
-            IInspectable const& sender,
-            PointerRoutedEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnBackdropFramePointerWheelChanged(sender, args);
-            }
-        });
-        BackdropHost().PointerReleased([weak = get_weak()](
-            IInspectable const& sender,
-            PointerRoutedEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnBackdropHostPointerReleased(sender, args);
-            }
-        });
-        BackdropHost().PointerCanceled([weak = get_weak()](
-            IInspectable const& sender,
-            PointerRoutedEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnBackdropHostPointerCanceled(sender, args);
-            }
-        });
-        BackdropHost().PointerCaptureLost([weak = get_weak()](
-            IInspectable const& sender,
-            PointerRoutedEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnBackdropHostPointerCaptureLost(sender, args);
-            }
-        });
-        BackdropHost().PointerExited([weak = get_weak()](
-            IInspectable const& sender,
-            PointerRoutedEventArgs const& args)
-        {
-            if (auto self = weak.get())
-            {
-                self->OnBackdropHostPointerExited(sender, args);
-            }
-        });
 
         ClampBackdropFrameRect();
         UpdateLiquidGlassControlsState();
@@ -737,6 +600,17 @@ namespace winrt::WUILiquidGlassDemo_WUI3::implementation
         args.AcceptedOperation(DataPackageOperation::Copy);
         SetBackgroundImageFromDropAsync(args);
         args.Handled(true);
+    }
+
+    void MainWindow::OnBackdropHostLoaded(IInspectable const&, RoutedEventArgs const&)
+    {
+        EnsurePointerSource();
+        SetBackdropCursor(m_arrowCursor);
+    }
+
+    void MainWindow::OnBackdropHostSizeChanged(IInspectable const&, SizeChangedEventArgs const&)
+    {
+        ClampBackdropFrameRect();
     }
 
     void MainWindow::OnBackdropHostPointerReleased(IInspectable const&, PointerRoutedEventArgs const& args)

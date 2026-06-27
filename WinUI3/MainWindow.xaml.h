@@ -8,6 +8,60 @@ namespace winrt::WUILiquidGlassDemo_WUI3::implementation
     {
         MainWindow();
 
+        void InitializeComponent();
+
+        void OnSetBackgroundImageClick(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnClearBackgroundImageClick(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnRootDragOver(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::DragEventArgs const& args);
+        void OnRootDrop(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::DragEventArgs const& args);
+        void OnBackdropHostLoaded(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
+        void OnBackdropHostSizeChanged(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::SizeChangedEventArgs const& args);
+        void OnBackdropHostPointerPressed(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnBackdropHostPointerMoved(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnBackdropFramePointerWheelChanged(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnBackdropHostPointerReleased(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnBackdropHostPointerCanceled(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnBackdropHostPointerCaptureLost(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnBackdropHostPointerExited(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
+        void OnEffectSelectionChanged(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
+        void OnBorderWidthChanged(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventArgs const& args);
+        void OnLiquidGlassParameterChanged(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventArgs const& args);
+        void OnGaussianBlurRadiusChanged(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventArgs const& args);
+
     private:
         enum class BackdropInteraction
         {
@@ -62,51 +116,6 @@ namespace winrt::WUILiquidGlassDemo_WUI3::implementation
         void EnsurePointerSource();
         void SetBackdropCursor(winrt::Microsoft::UI::Input::InputCursor const& cursor);
         void UpdateBackdropCursor(winrt::Windows::Foundation::Point const& position);
-        void OnBackdropHostPointerPressed(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
-        void OnBackdropHostPointerMoved(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
-        void OnBackdropFramePointerWheelChanged(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
-        void OnSetBackgroundImageClick(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
-        void OnClearBackgroundImageClick(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
-        void OnRootDragOver(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::DragEventArgs const& args);
-        void OnRootDrop(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::DragEventArgs const& args);
-        void OnBackdropHostPointerReleased(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
-        void OnBackdropHostPointerCanceled(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
-        void OnBackdropHostPointerCaptureLost(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
-        void OnBackdropHostPointerExited(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
-        void OnEffectSelectionChanged(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& args);
-        void OnBorderWidthChanged(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventArgs const& args);
-        void OnLiquidGlassParameterChanged(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventArgs const& args);
-        void OnGaussianBlurRadiusChanged(
-            winrt::Windows::Foundation::IInspectable const& sender,
-            winrt::Microsoft::UI::Xaml::Controls::Primitives::RangeBaseValueChangedEventArgs const& args);
         void EndBackdropInteraction();
         HWND GetWindowHandle();
     };
