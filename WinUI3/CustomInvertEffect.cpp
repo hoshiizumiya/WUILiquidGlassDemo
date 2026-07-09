@@ -47,7 +47,8 @@ export float4 PSBody(float4 sample0)
         kShaderArguments,
         ARRAYSIZE(kShaderArguments),
         0,
-        true,
+        // Profile 1: match wuceffectsi generated-effect default (lib_4_0_level_9_3).
+        CustomEffectRuntime::kShaderProfileLevel93,
         0,
         nullptr,
         false,

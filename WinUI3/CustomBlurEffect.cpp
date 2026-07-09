@@ -80,7 +80,8 @@ export float4 PSBodyM(float2 uv, float4 samplerDataExt) { return BlurCore(uv, sa
         kShaderArguments,
         ARRAYSIZE(kShaderArguments),
         kBackdropCustomSamplerResult,
-        true,
+        // Profile 1: stay on the 9.3 path used by most composition effects.
+        CustomEffectRuntime::kShaderProfileLevel93,
         0,
         nullptr,
         false,

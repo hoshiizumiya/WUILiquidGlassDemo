@@ -82,7 +82,9 @@ namespace
         char const* functionName;
         uint32_t constantBufferSize;
         uint16_t linkingArgType;
-        uint8_t hasCustomSamplers;
+        // D3DShaderProfileVersion (1 byte). Misnamed historically as
+        // hasCustomSamplers because wuceffectsi almost always wrote 1 here.
+        uint8_t shaderProfileVersion;
         uint8_t padding;
     };
 
@@ -257,19 +259,45 @@ namespace
         return nullptr;
     }
 
+    char const* GetShaderLibraryProfile(uint8_t shaderProfileVersion)
+    {
+        // Must stay paired with ShaderLinkingBody::shaderProfileVersion / the
+        // D3DShaderProfileVersion byte DWM reads at body+0x2E:
+        //   0 -> ps_4_0_level_9_1  (lib_4_0_level_9_1_ps_only)
+        //   1 -> ps_4_0_level_9_3  (lib_4_0_level_9_3_ps_only)  [wuceffectsi default]
+        //   2 -> ps_4_0            (lib_4_0)
+        // There is no ps_5_0 / lib_5_0 path in dwmcorei: Link only knows those three
+        // targets, and GetFragmentsModuleNoRef only loads three prebuilt modules.
+        // A lib_5_0 blob can D3DLoadModule but fails at ID3D11Linker::Link when mixed
+        // with 4.0-class fragment helpers (E_FAIL).
+        switch (shaderProfileVersion)
+        {
+        case CustomEffectRuntime::kShaderProfileLevel91:
+            return "lib_4_0_level_9_1_ps_only";
+        case CustomEffectRuntime::kShaderProfilePs40:
+            return "lib_4_0";
+        case CustomEffectRuntime::kShaderProfileLevel93:
+        default:
+            return "lib_4_0_level_9_3_ps_only";
+        }
+    }
+
     void CompileShaderLibrary(
         char const* source,
         size_t sourceSize,
+        uint8_t shaderProfileVersion,
         ID3DBlob** shaderBlob)
     {
-        // wuceffectsi!EffectGenerator::BuildCompiledEffectSubgraph does not compile
-        // generated effects as lib_5_0. This WinUI3 build passes
-        // "lib_4_0_level_9_3_ps_only" and flags 0x8800
-        // (STRICTNESS | OPTIMIZATION_LEVEL3) to D3DCompile, then dwmcorei links the
-        // library into ps_4_0/ps_4_0_level_9_x. Matching that profile is intentional:
-        // D3DLoadModule/CreateInstance accepts a lib_5_0 blob, but the final DWM
-        // ID3D11Linker::Link path rejects the mixed-profile graph with E_FAIL.
+        // Compile a shader-linking *library* module, not a standalone pixel shader.
+        // dwmcorei!LoadShaderBody does D3DLoadModule + CreateInstance(functionName);
+        // a plain ps_4_0 blob is not a loadable module.
+        //
+        // wuceffectsi!EffectGenerator::BuildCompiledEffectSubgraph hardcodes
+        // "lib_4_0_level_9_3_ps_only" and flags 0x8800 (STRICTNESS | OPTIMIZATION_LEVEL3).
+        // Profile 2 effects instead use "lib_4_0" so the bytecode matches
+        // CShaderLinkingGraphBuilder::Link's "ps_4_0" target and fragment module 2.
         UINT flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+        char const* profile = GetShaderLibraryProfile(shaderProfileVersion);
 
         winrt::com_ptr<ID3DBlob> errors;
         check_hresult(D3DCompile(
@@ -278,12 +306,8 @@ namespace
             nullptr,
             nullptr,
             nullptr,
-            // dwmcorei!LoadShaderBody consumes this blob with D3DLoadModule and then
-            // CreateInstance(functionName). A standalone ps_4_0 blob compiles locally
-            // but is not a loadable shader-linking module, so this runtime keeps the
-            // code-only path aligned with wuceffectsi's generated-effect profile.
             nullptr,
-            "lib_4_0_level_9_3_ps_only",
+            profile,
             flags,
             0,
             shaderBlob,
@@ -303,6 +327,7 @@ namespace
             CompileShaderLibrary(
                 definition.shaderSource,
                 definition.shaderSourceSize,
+                definition.shaderProfileVersion,
                 entry->shaderBlob.put());
         });
     }
@@ -717,13 +742,15 @@ namespace
             subgraph->constantBufferInitialBegin,
             subgraph->constantBufferInitialEnd);
         body->linkingArgType = subgraph->linkingArgType;
-        // wuceffectsi!CompiledEffect::GetSubgraphShaderLinkingBody writes this byte as
-        // 1 for generated shader-linking subgraphs, including ordinary CompositeEffect
-        // passthrough code. The flatten stage still uses color-input arguments; this
-        // byte is kept native-shaped so DWM treats it as generated linker code.
-        body->hasCustomSamplers = isMainSubgraph
-            ? (definition.hasCustomSamplers ? 1 : 0)
-            : 1;
+        // Body+0x2E is D3DShaderProfileVersion (1 byte). LinkShader takes it from the
+        // technique's main body and applies it to that entire link (target string +
+        // GetFragmentsModuleNoRef). Scope is one CRenderingTechnique, not the brush
+        // or visual tree: other techniques / brushes link independently after any
+        // intermediate is materialized to a surface. All subgraphs of one definition
+        // share one blob, so every body reports the same version — including
+        // flatten/final helpers that may be pulled into the same span as 0x0500 deps.
+        // wuceffectsi always writes 1; CCustomKernelEffect writes 0/1/2 from FL.
+        body->shaderProfileVersion = definition.shaderProfileVersion;
         body->padding = 0;
         return body;
     }

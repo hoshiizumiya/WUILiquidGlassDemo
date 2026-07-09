@@ -335,7 +335,12 @@ export float4 PSBodyM(float2 uv, float4 samplerDataExt, float4 samplerData) { re
         kShaderArguments,
         ARRAYSIZE(kShaderArguments),
         kBackdropCustomSamplerResult,
-        true,
+        // Profile 2: ps_4_0 + lib_4_0 (full SM4.0, not SM5). Verified runnable
+        // for this brush because flatten materializes to an intermediate surface
+        // and the glass technique links alone — not co-linked with wuceffectsi
+        // profile-1 bodies. Still must keep body+0x2E and D3DCompile paired; see
+        // CustomEffectRuntime.h (D3DShaderProfileVersion + isolation notes).
+        CustomEffectRuntime::kShaderProfilePs40,
         sizeof(kInitialConstants),
         &kInitialConstants,
         true,
