@@ -13,7 +13,10 @@
 - sampler discovery、`samplerData`、`samplerDataExt`
 - animated property、constant-buffer updater 和 change stamp
 - forward bounds、reverse input bounds 和 CPU-side culling contract
+- visual traversal、alpha/color contract、shadow 与 mask realization
+- composition command、resource table 与 notifier-driven invalidation
 - shader module loading、fragment linking、profile 和 shader cache
+- factory、graph、shader、constant buffer 与 intermediate 的分层失效成本
 - 多纹理输入在这条内部路径上的真实限制
 
 > [!WARNING]
@@ -56,6 +59,8 @@ Lifted Compositor 生成的内容最终仍会进入更大的 Windows composition
   - SHA-2 digest：`dbea457ac1c6d5c4cde5b9cfb09e65cd54b11596406ce50565ddd946468b1454`
 - `dwmcorei.dll`
   - SHA-2 digest：`06799367a4fcbd21832c91560720b7d131016abbaed4a1e64349df1e531e5d3c`
+- `Microsoft.ui.xaml.dll`
+  - SHA-2 digest：`2b22eb6130821f43a26239d441ef3a898bea24b1c1078b5941249431c4b4fbf8`
 
 ## 一句话模型
 
@@ -499,6 +504,7 @@ DWM 使用的不是常规 `D3DCompile(entryPoint, ps_4_0)` 路径，而是：
 | `CompositionBrush` | 公共层 | composition tree 中的运行时内容 producer |
 | `CompositionEffectBrush` | 公共层 | factory 的运行时实例，保存 source bindings 和动态属性 |
 | `EffectType` | WUCEffectsI | GUID 对应的内部 effect 元数据与行为虚表 |
+| `EffectOpacityRelation` | WUCEffectsI | 从最终 output 反向标记哪些 named inputs 影响 opaque proof |
 | `EffectNode` | WUCEffectsI | flattened graph 中的一个 effect 实例 |
 | named input | WUCEffectsI | 由 `SetSourceParameter` 在 brush 实例阶段绑定的图输入 |
 | `EffectSubgraph` | WUCEffectsI | 一组可以一起编译或作为一个输出边界处理的 nodes |
@@ -509,12 +515,17 @@ DWM 使用的不是常规 `D3DCompile(entryPoint, ps_4_0)` 路径，而是：
 | `ConstantBufferUpdater` | WUCEffectsI | 把某个 node 的 native property struct 写入 subgraph constant buffer |
 | bounds contract | WUCEffectsI | 在 CPU 上正向计算输出范围，并从可见输出反推实际需要的输入范围 |
 | `CEffectBrush` | DWM | effect brush 的渲染侧资源对象 |
+| `CPropertySet` | DWM | animated property 的 channel resource，并回调 `CEffectBrush` 更新 `IEffectInstance` |
+| `NodeEffects` | DWM | 当前 visual 的 local clip、opacity、filter/tree effect、resample 与 color-space 状态 |
 | `CBrushRenderingGraph` | DWM | brush、surface、intermediate 和 fragment 的渲染图 |
 | `CRenderingTechniqueFragment` | DWM | 可被 shader linker 连接的一个渲染片段 |
 | `CRenderingTechnique` | DWM | 一次实际渲染 pass 和一轮 shader link 的边界 |
 | `ShaderLinkingBody` | DWM | 一个 library function、参数语义、bytecode 和 profile 的描述 |
 | `ShaderLinkingConfig` | DWM | surface、sampler、edge mode、颜色处理等 link 配置 |
 | `CLinkedShader` | DWM | 已连接 bytecode、pixel shader 和相关缓存对象 |
+| `CDropShadow` | DWM | 单 visual/content mask 的显式 offset/blur/color shadow |
+| `CProjectedShadowScene` | DWM | light、casters、receivers 与投影绘制顺序的 scene-level shadow 系统 |
+| `CShadowMaskProducer` | DWM | 把 brush + geometry/bounds clip rasterize 为可缓存 alpha mask realization |
 
 ### 结构布局记法
 
@@ -757,6 +768,106 @@ WUCEffectsI 的 `Traverser` 分为两个阶段：
 
 一个错误的 capability bit 会改变 graph shape，而不仅是改变一个优化选项。
 
+#### `EffectType` 的 22 槽虚表合同
+
+当前 build 的 callable ABI 到 `+0xA8` 为止，共 22 个槽。下面保留已有符号名；没有独立符号、但可由唯一 producer 和消费点定性的名称标为“本文重建名称”：
+
+```cpp
+struct EffectTypeVtable
+{
+    /* +0x00 */ char const* (*GetShaderFragmentName)(EffectType const*);
+    /* +0x08 */ GUID const& (*GetGuid)(EffectType const*);
+    /* +0x10 */ EffectSamplingBehavior (*GetEffectSamplingBehavior)(EffectType const*);
+    /* +0x18 */ bool (*IsValidInputCount)(EffectType const*, uint32_t);
+    /* +0x20 */ bool (*IsValidInputType)(EffectType const*, EffectNodeInputType);
+    /* +0x28 */ bool (*RequiresSourceFlattening)(EffectType const*);
+    /* +0x30 */ bool (*IsInputTransform)(EffectType const*, uint32_t* inputIndex);
+
+    /* +0x38 */ bool (*IsBorderEffectKind)(EffectType const*); // 本文重建名称
+    /* +0x40 */ bool (*ForceAuxiliaryBinding)(EffectType const*); // 生成 flag 0x4
+    /* +0x48 */ bool (*ConditionalAuxiliaryBinding)(EffectType const*); // 生成 flag 0x2
+    /* +0x50 */ bool (*ReserveWhiteNoiseSamplerConstant)(EffectType const*); // 生成 flag 0x10
+    /* +0x58 */ bool (*KeepFragmentOutput)(EffectType const*); // 生成 flag 0x8
+    /* +0x60 */ bool (*DisallowSdrBoostConversionElision)(EffectType const*); // 生成 flag 0x20
+
+    /* +0x68 */ bool (*IsIntersectionCombinator)(EffectType const*, void const* props);
+    /* +0x70 */ bool (*IsNoOp)(EffectType const*, uint32_t inputCount, void const* props);
+    /* +0x78 */ RectF (*GetBounds)(EffectType const*, void const* props,
+                                   std::vector<RectF> const& inputBounds);
+    /* +0x80 */ void (*CalcInversedWorldInputBounds)(EffectType const*, void const* props,
+                                                     RectF const& visibleOutput,
+                                                     RectF const& availableInput,
+                                                     RectF* inputBounds);
+    /* +0x88 */ uint32_t (*GetPropertiesStructSize)(EffectType const*);
+    /* +0x90 */ void (*GetPropertiesMetadata)(EffectType const*, uint32_t*,
+                                              EffectPropertyMetadata const**);
+    /* +0x98 */ void (*Validate)(EffectType const*, EffectNode const&);
+    /* +0xA0 */ void (*GenerateCode)(EffectType const*, EffectNode const&,
+                                     EffectGenerator*, char const* outputName);
+    /* +0xA8 */ EffectOpacityRelation (*GetEffectOpacityRelation)(EffectType const*,
+                                                                  EffectNode const&);
+};
+```
+
+`+0x38..+0x60` 不是一组可以随意复用的 generic bool。当前 type table 的置位集合精确为：
+
+```text
++0x38: BorderEffect
++0x40: PointDiffuse、PointSpecular、SpotDiffuse、SpotSpecular
++0x48: SceneLightingEffect
++0x50: WhiteNoiseEffect
++0x58: SceneLightingEffect
++0x60: ArithmeticComposite、Blend、ColorMatrix、Contrast、
+       DistantDiffuse、DistantSpecular、Exposure、Flood、GammaTransfer、
+       Grayscale、HueRotation、Invert、LinearTransfer、LuminanceToAlpha、
+       PointDiffuse、PointSpecular、Saturation、SceneLighting、Sepia、
+       SpotDiffuse、SpotSpecular、TemperatureAndTint、Tint、WhiteNoise
+```
+
+这些 producer 集合比把槽位统称为“reserved capability”更有用。`EffectGenerator::EmitNode @ 0x180016660` 把 `+0x48/+0x40/+0x50/+0x60` 分别 OR 成 compiled-subgraph flags `0x2/0x4/0x10/0x20`；`EmitShaderSourceForSubgraph @ 0x1800168E8` 在最终 node 的 `+0x58` 为真时 OR `0x8`。此外，`+0x28` 会触发 source-flattening wrapper，`+0x30` 返回被 transform 的 input index，`+0x48` 还被 Gaussian-blur source 校验用于拒绝 `SceneLightingEffect`，`+0x58` 会让 subgraph enumeration 从独立 root 开始。
+
+#### `EffectOpacityRelation`：多输入 graph 的 opaque-input 依赖
+
+`GetEffectOpacityRelation @ +0xA8` 返回的三个值可由 `DoesNodeHaveOpacityRelevance @ 0x1800121E8` 和 `SetNodeOpacityRelevance @ 0x180013304` 的递归分支直接定性：
+
+```cpp
+enum class EffectOpacityRelation : uint32_t
+{
+    NoInputDependency  = 0, // 本文重建枚举名
+    AnyRelevantInput   = 1, // 任一 source 可建立 opacity relevance
+    AllRelevantInputs  = 2, // 所有 source 都必须具有 opacity relevance
+};
+```
+
+其传播算法可精简为：
+
+```cpp
+bool DoesNodeHaveOpacityRelevance(Node const& node)
+{
+    switch (node.type->GetEffectOpacityRelation(node))
+    {
+    case NoInputDependency:
+        return false;
+    case AnyRelevantInput:
+        return any_of(node.inputs, InputHasOpacityRelevance);
+    case AllRelevantInputs:
+        return all_of(node.inputs, InputHasOpacityRelevance);
+    }
+}
+
+void MarkRelevantNamedInputs(Node const& node)
+{
+    if (node.opacityRelation == AnyRelevantInput)
+        MarkOneInputThatCanProveOpacity(node);
+    else if (node.opacityRelation == AllRelevantInputs &&
+             all_of(node.inputs, InputHasOpacityRelevance))
+        for (auto const& input : node.inputs)
+            MarkInputRecursively(input);
+}
+```
+
+`BlendEffectType::GetEffectOpacityRelation @ 0x18000A910` 固定返回 1。`CompositeEffectType::GetEffectOpacityRelation @ 0x18001EDA0` 仅在 composite mode property 为 0 时返回 1，否则返回 0。`FlattenedEffectGraph::Finalize @ 0x1800122E4` 从最终 subgraph 反向标记真正影响 opaque 判定的 named inputs；DWM 后续不必要求所有 effect inputs 都是 opaque。
+
 ### source 的几种形状
 
 `VisitEffectInputs` 观察到的 source 可能是：
@@ -764,7 +875,7 @@ WUCEffectsI 的 `Traverser` 分为两个阶段：
 - null input
 - named graph input
 - 另一个 `IGraphicsEffect`
-- 已访问过的 effect/subgraph
+- enumeration 已建立的 flatten/subgraph occurrence
 
 最终 `EffectNode` 的 input 不是直接保存一张纹理，而是保存“输入类型 + 索引”。
 
@@ -801,7 +912,9 @@ void VisitEffectInput(IGraphicsEffectSource* source) // 本文重建名称
     }
     else if (auto childEffect = TryAsIGraphicsEffect(source))
     {
-        if (auto existing = FindPreviouslyVisitedEffect(childEffect))
+        // public object reuse 已在 enumeration 阶段按 non-tree graph 拒绝；
+        // 此处的 existing 只表示已建立的 flatten/subgraph occurrence。
+        if (auto existing = FindExistingFlattenedOccurrence(childEffect))
             StoreInput({ InputKind::ExistingNodeOrSubgraph, existing.index });
         else
             StoreInput({ InputKind::EffectNode, VisitEffect(childEffect) });
@@ -868,6 +981,49 @@ else
 ```
 
 所以准确关系是：`effect edge` 先决定 node dependency，traversal 再决定是否跨 subgraph，DWM 最后决定这些 compiled bodies 是在同一 technique 中 link、通过 no-op alias 传递，还是跨 techniques materialize。
+
+### factory graph 必须是 tree，不接受共享 effect node 或 cycle
+
+公共 description 常被口头称为 effect DAG，但当前 traversal 对 `IGraphicsEffect*` identity 的要求更严格：同一个 effect object 只能在 factory tree 中出现一次。`Traverser::EnumerateEffectSubgraphs @ 0x18000CB3C` 在递归进入 effect 前查询一个以 COM object pointer 为 key 的 `std::unordered_set<IGraphicsEffect*>`；第二次命中直接产生：
+
+```text
+Non-tree shaped effect graph.
+```
+
+其行为可写成：
+
+```cpp
+void EnumerateEffectSubgraphs(IGraphicsEffect* effect)
+{
+    if (visitedEffectObjects.contains(effect))
+        OriginateException("Non-tree shaped effect graph.");
+
+    visitedEffectObjects.emplace(effect);
+
+    for (IGraphicsEffectSource* source : effect->Sources())
+        if (auto child = TryAsIGraphicsEffect(source))
+            EnumerateEffectSubgraphs(child);
+}
+```
+
+因此下面两种形状都会被拒绝：
+
+```text
+共享 node： A -> C <- B，A.Source 与 B.Source 指向同一个 C object
+环：       A -> B -> A
+```
+
+cycle 不需要单独的 recursion-stack 算法：回到 A 时已经命中同一个 identity set，因此同样归入 non-tree failure。若需要两处执行相同 effect，应创建两个具有相同 properties 的 effect objects；它们可以生成等价 nodes，但 pointer identity 必须不同。
+
+`VisitEffectInputs` 后续仍可能写入 `ExistingNodeOrSubgraph`。这不表示公共 graph 允许共享 object；它用于引用 enumeration 阶段已经建立的 flatten wrapper/subgraph occurrence。应区分：
+
+```text
+同一 public IGraphicsEffect object 被两个 parent 引用 -> 非 tree，拒绝
+同一 source-flattening occurrence 在 partition 后被引用 -> 内部 index edge，允许
+两个独立但值完全相同的 effect objects             -> 两个 EffectNode，允许
+```
+
+nested `CompositionEffectBrush` 也不是 factory graph cycle。它在 factory 编译结束后才通过 named source parameter 进入 DWM brush-resource tree；每个 factory 仍独立拥有自己的 flattened tree。brush-resource dependency 的有效性与生命周期属于 composition channel/DWM resource 层，factory traversal 的 `visitedEffectObjects` 不参与该判断。
 
 ### named input
 
@@ -1320,8 +1476,8 @@ HRESULT EffectInstance::SetAnimatableProperty(
     uint32_t animatablePropertyIndex,
     DCOMPOSITION_EXPRESSION_TYPE expressionType,
     void const* value,
-    bool* changed,
-    uint32_t* changedSubgraphIndex);
+    bool* surfaceTransformChanged,
+    uint32_t* changedNodeIndex);
 ```
 
 `GetAnimatablePropertyDesc @ 0x180012410` 和 `SetAnimatableProperty` 的实际 worker `@ 0x18001A020` 都先以 vector element count 检查该 32-bit index，再读取 `nodeIndex +0x08`、`propertyIndex +0x0C` 和 `mapping +0x14`。
@@ -1798,8 +1954,8 @@ struct IEffectInstanceVtable
         uint32_t propertyIndex,
         DCOMPOSITION_EXPRESSION_TYPE expressionType,
         void const* value,
-        bool* valueWasClamped,
-        uint32_t* changedSubgraph);
+        bool* surfaceTransformChanged,
+        uint32_t* changedNodeIndex);
     bool (*IsNoOpSubgraph)(void* self, uint32_t subgraphIndex);   // +0x28
     void (*GetBlurParams)(                                        // +0x30
         void* self,
@@ -3077,6 +3233,652 @@ visual + visual-tree path
 
 BVI 本身还用于 backdrop brush、window-background producer 和 composition magnifier，并不是 Gaussian blur 专属对象；Gaussian blur 只是识别 BVI input 后，额外建立了“同一 backdrop realization 的 blur result”缓存。
 
+## DWM 的 shadow 系统：Drop、Projected 与 ThemeShadow
+
+DWM 中至少有两套真正不同的 shadow renderer；XAML `ThemeShadow` 再在它们之上选择 projected 模式或 drop-shadow fallback：
+
+| 系统 | 核心对象 | 输入关系 | 主要用途 |
+|---|---|---|---|
+| drop shadow | `CDropShadow` | 一个 visual/content mask | 显式 blur、offset、color、opacity |
+| projected shadow | `CProjectedShadowScene`、caster、receiver | light + caster + receiver plane | element elevation、ThemeShadow、popup |
+| ThemeShadow fallback | XAML shadow visual + drop-shadow recipe | theme/depth recipe | projected shadow 不适用时的预生成阴影 |
+
+### `CDropShadow`：对一个 alpha mask 做偏移、模糊和着色
+
+`CDropShadow` 是 visual/layer 级内容资源。当前 build 中 shadow-specific fields 可从 setters 和 draw path 恢复为：
+
+```cpp
+struct CDropShadow // 只列出当前确认的 shadow fields；成员名为本文重建名称
+{
+    // CContent/resource base ...
+    D3D_COLOR_F color;                         // +0x48，默认 (0,0,0,1)
+    float blurRadius;                          // +0x58，默认 9
+    float opacity;                             // +0x5C，默认 1
+    D2D_VECTOR_3F offset;                      // +0x60
+    D2D_RECT_F occlusionRect;                  // +0x6C
+    uint32_t sourcePolicy;                     // +0x7C
+    ShadowIntermediates defaultIntermediates;  // +0x80
+    // ...
+    std::unordered_map<CVisual*, ShadowIntermediates>
+        perVisualIntermediates;                // +0xC8
+};
+```
+
+命令入口明确提供：
+
+```text
+BlurRadius
+Color
+Mask
+Offset
+Opacity
+SourcePolicy
+```
+
+普通绘制流程如下：
+
+```text
+mask/content alpha
+  -> ShadowIntermediates::UpdateIntermediates
+  -> fast-shadow asset 或 CShadowBlurProducer
+  -> blurred opacity brush
+  -> color × opacity
+  -> offset
+  -> optional occlusion cutout
+  -> CDropShadow::GenerateDrawList @ 0x1800D1FE0
+```
+
+`CSpriteVisual::ProcessSetShadow @ 0x18019B68C` 和 `CLayerVisual::ProcessSetShadow @ 0x1800CE4F0` 把 composition shadow resource 接到 visual/layer；`GetBounds @ 0x1800D2520`、`CLayerVisual::GetUpdatedDropShadowBounds @ 0x1800CE170` 负责把 blur 和 offset 扩张计入 bounds。
+
+### `CProjectedShadow`：把 caster 投影到 receiver plane
+
+projected shadow 不是“自动计算 offset 的 `CDropShadow`”。它是 scene-level 系统：
+
+```text
+CProjectedShadowScene
+  ├─ ordered CProjectedShadowCaster collection
+  ├─ CProjectedShadowReceiver collection
+  ├─ CompositionLight
+  └─ CProjectedShadow(scene, caster, receiver)
+```
+
+一个 `CProjectedShadow` 对应一个已准备的 caster/receiver 投影组合：
+
+```cpp
+HRESULT CProjectedShadow::Initialize(
+    CProjectedShadowScene* scene,
+    CProjectedShadowCaster* caster,
+    CProjectedShadowReceiver* receiver);
+```
+
+scene 会计算：
+
+- light 在当前 visual tree 中的位置
+- receiver visual 的平面
+- caster 到 receiver 的 projection matrix
+- caster 是否位于 light 和 receiver 之间
+- shadow 应在 receiver 前还是后绘制
+- 距离相关的 blur radius 与 opacity
+
+关键入口包括：
+
+```text
+CProjectedShadowScene::PrepareShadows                 @ 0x1800F8C34
+ShadowHelpers::GetProjectionOntoVisualMatrix          @ 0x1801786B8
+CProjectedShadow::ComputeShadowPath                   @ 0x1800B4B64
+CProjectedShadow::GenerateApproxBlur                  @ 0x1800B4FD4
+CProjectedShadowApproxBlurGraphBuilder::Build         @ 0x1800EC7D0
+CVisual::RenderProjectedShadows                       @ 0x1800C1AB4
+```
+
+它仍不是通用 3D shadow map：输入是二维 caster coverage，沿 composition light 投到一个二维 receiver plane，而不是给任意三维 mesh 建 depth map。
+
+### XAML `ThemeShadow` 如何映射到 projected shadow
+
+XAML 侧存在明确的：
+
+```text
+CThemeShadow
+ElementShadowSource
+ShadowCasterPair
+ThemeShadowScene
+ProjectedShadowManager
+```
+
+`ProjectedShadowManager::UpdateCasterStatus @ 0x18094E830` 把 element/visual、`CThemeShadow::m_maskBrush` 和 popup/island context 交给 `ThemeShadowScene::AddNewCaster @ 0x18094D054`。element caster 使用 `ElementShadowSource` 保存弱引用；`GetVisualNoRef @ 0x18094E020` 再从 `ProjectedShadowManager::m_shadowVisuals` 找到专门用于 shadow 的 composition visual。
+
+```text
+UIElement.Shadow = ThemeShadow
+  -> ProjectedShadowManager
+  -> ElementShadowSource / ShadowCasterPair
+  -> Microsoft.UI.Composition projected-shadow objects
+  -> DWM CProjectedShadowScene/Caster/Receiver
+```
+
+`ThemeShadow` 也有 drop-shadow mode。该路径使用 `DropShadowRecipe` 创建专门的 shadow visual，把结果放进 `CompositionVisualSurface`，再包成 cached `CompositionNineGridBrush`。因此 fallback 更像按 theme/depth recipe 生成并拉伸的预制阴影，而不是继续运行 caster/receiver projection。
+
+### shadow mask 到底是什么
+
+这里的 mask 是一张标量 alpha/coverage image：
+
+```text
+0     -> 此像素不投影/不产生阴影
+0..1  -> partial coverage / antialiasing
+1     -> full shadow coverage
+```
+
+shadow color、opacity、projection 和 blur 在 mask 之后应用。mask 本身不是最终阴影颜色，也不是任意 effect graph 的 RGBA 输出。
+
+### `CDropShadow` 的 mask 来源
+
+`CDropShadow::ProcessSetMask @ 0x1800D2B50` 接收一个 `CBrush*` resource，并交给 `ShadowIntermediates::SetMask @ 0x1800D2E68`。后者注册 change notifier；mask brush 改变时释放已有 blur realization。
+
+运行时存在两条来源：
+
+```cpp
+// CDropShadow::UpdateShadowIntermediates @ 0x1800D338C
+ShadowIntermediates* GetEffectiveIntermediates(
+    CDropShadow* shadow,
+    CDrawingContext* context)
+{
+    if (shadow->sourcePolicy == 1)
+    {
+        CVisual* currentVisual = context->CurrentShadowVisual(); // 本文重建名称
+        CBrush* contentBrush = currentVisual->GetContentAsBrushNoRef();
+
+        ShadowIntermediates& perVisual =
+            shadow->perVisualIntermediates[currentVisual];
+        perVisual.SetMask(shadow, contentBrush);
+        return &perVisual;
+    }
+
+    return &shadow->defaultIntermediates; // 显式 Mask
+}
+```
+
+所以：
+
+- 显式 `Mask`：直接使用调用者提供的 composition brush。
+- `sourcePolicy == 1`：DWM 从当前被绘制 visual 取得 content brush，以其输出 alpha 作为 mask；同一个 `CDropShadow` 用在不同 visuals 上时，每个 visual 有独立的 `ShadowIntermediates` cache。
+
+简单矩形/solid 情况可以使用共享 fast-shadow bitmap 和 nine-grid；复杂 brush 或半径超出 fast path 时，`CShadowBlurProducer::Create @ 0x180176E9C` 生成实际 mask/blur intermediate。
+
+### projected caster mask 的来源
+
+projected caster 同时有多个容易混淆的输入：
+
+```cpp
+struct CProjectedShadowCaster // 只列出相关槽；字段名为本文重建名称
+{
+    CVisual* castingVisual;        // +0x48
+    CVisual* ancestorClipVisual;   // +0x50
+    CBrush* shadowBrush;           // +0x80，public caster Brush
+    CBrush* maskBrush;             // +0x88，private/internal mask channel
+};
+```
+
+`shadowBrush` 决定阴影着色；`maskBrush` 决定 caster coverage。二者不是同一个概念。XAML `ShadowCasterPair` 会把 `CThemeShadow::m_maskBrush` 保存并传入 projected-shadow caster；没有显式 mask 时 DWM 使用默认 opaque brush，再靠 casting visual 的 geometry/size 限制轮廓。
+
+`CProjectedShadowCaster::UpdateMaskIntermediate @ 0x1800C9634` 的主要路径是：
+
+```cpp
+void UpdateCasterMask(CProjectedShadowCaster* caster) // 本文重建名称
+{
+    CVisual* visual = caster->castingVisual;
+    D2D_SIZE_F size = visual->Size();
+
+    CShapePtr shape;
+    if (visual->geometry != nullptr)
+        shape = visual->geometry->GetShapeData(size);
+
+    CBrush* fill = caster->maskBrush;
+    if (fill == nullptr)
+        fill = composition->DefaultOpaqueBrush(); // 本文重建名称
+
+    caster->cachedMask = CShadowMaskProducer::Create(
+        "DWM ProjectedShadow Caster Mask",
+        drawingContext,
+        size,
+        fill,
+        std::move(shape),
+        ...);
+}
+```
+
+这说明默认 caster mask 更接近“casting shadow visual 的几何 coverage”，不等于每次把原 UIElement 最终合成后的全部彩色像素重新读回。需要精确 alpha silhouette 时，XAML/调用方可以提供 composition mask brush；Shape、TextBlock、Image 等 XAML 类型另外拥有 `GetAlphaMask`/`AlphaMask::RasterizeElement` 路径，可以生成这种 brush，但它不是所有 ThemeShadow caster 都无条件执行的步骤。
+
+### `CShadowMaskProducer` 如何把 brush 变成 mask bitmap
+
+`CShadowMaskProducer::Create @ 0x1801773A0` 创建 cached image producer，并立即生成第一份 realization。真正的 raster path 位于 `ShadowHelpers::GenerateMaskIntermediate @ 0x180177AC4`：
+
+```cpp
+IRenderTargetBitmap* GenerateMaskIntermediate(
+    D2D_SIZE_F size,
+    CBrush* maskBrush,
+    CShape const* optionalShape,
+    bool clipToBounds,
+    D2D_RECT_F contentBounds)
+{
+    auto target = PushOffScreenRenderingLayer(size);
+
+    // 留出/保护 texture border，避免 blur 与线性采样从边界读入脏值。
+    PushGpuClipRect(InsetByOnePixel(target->Bounds()));
+    PushMaskLocalTransform();
+
+    if (optionalShape != nullptr)
+        PushClipShape(optionalShape);
+    else if (clipToBounds)
+        PushClipRect(contentBounds);
+
+    maskBrush->Draw(drawingContext, size);
+    PopLayer();
+    return target;
+}
+```
+
+因此 mask 的实际内容就是：
+
+```text
+mask brush 的输出 alpha
+  × optional caster/receiver geometry clip
+  × bounds clip
+  -> off-screen alpha realization
+```
+
+brush、geometry 或 visual generation 改变时，notifier/visual-tree keyed cache 会让对应 `CShadowMaskProducer` realization 失效。
+
+### receiver mask 与最终合成
+
+receiver 也可以有独立 mask。`CProjectedShadowReceiver::GetReceiverMaskInputBrush @ 0x1800EBDBC` 使用显式 receiver mask；若为空则使用默认 opaque brush覆盖 receiver bounds。复杂 mask 会创建名为 `"DWM ProjectedShadow Receiver Mask"` 的 `CShadowMaskProducer` realization。
+
+`CProjectedShadow::GenerateDrawList @ 0x1800B5980` 最终把两个 inputs 交给 `CProjectedShadowRenderingEffect`：
+
+```text
+input 0: projected + blurred caster shadow coverage
+input 1: receiver coverage mask
+
+output = ShadeAndComposite(
+    projectedCasterMask,
+    receiverMask,
+    caster.shadowBrush,
+    computedOpacity,
+    projectionTransform)
+```
+
+这使 shadow 只落在 receiver 允许的区域内；receiver mask 不参与 caster blur 的生成，而是在投影后的合成阶段裁定接收区域。
+
+### public alpha mask 与 DWM shadow mask 的边界
+
+两者都描述 coverage，但不是同一个对象，也处在不同生命周期：
+
+```cpp
+// Public Composition contract；返回可被应用继续连接和采样的 brush。
+CompositionBrush UIElement::GetAlphaMask();
+
+// DWM internal contract；名称为本文重建名称。
+struct ShadowMaskRealization
+{
+    IRenderTargetBitmap* bitmap; // rasterized alpha coverage
+    D2D_RECT_F bounds;
+    RenderTargetInfo targetDomain;
+    uint32_t contentGeneration;
+};
+```
+
+`GetAlphaMask()` 暴露的是未经过 shadow blur 的 `CompositionBrush` producer。应用可以把它设置为 effect 的 named input；只要 effect runtime 能把该 named input 映射成独立 surface，它就能作为普通 shader texture 被采样。
+
+`CShadowMaskProducer` 的输出则是 DWM 为一次 shadow realization 私有生成的 off-screen bitmap。它受 caster/receiver geometry、bounds、target compatibility 和内部 cache 生命周期约束，没有对应的 public resource ID，也不会自动出现在 custom effect 的 input list 中。custom shader 因而不能“借用当前 element shadow 已经算好的 mask”；若需要 non-blurred element coverage，应显式传入 `GetAlphaMask()` 或等价 brush。
+
+边界可以精确写成：
+
+```text
+public GetAlphaMask brush
+  -> 可作为 command/resource graph 中的 CBrush
+  -> 可作为 effect named input
+
+internal shadow mask realization
+  -> 由 CShadowMaskProducer 临时 rasterize/cache
+  -> 只供 CDropShadow/CProjectedShadow rendering path 消费
+  -> 不注册成应用可寻址的 CompositionBrush
+```
+
+### XAML / Composition 对象怎样跨到 DWM resource
+
+setter 不会把进程内 C++ pointer 直接传给 DWM。Composition channel 发送固定 command，其中只保存 resource ID；DWM 在自己的 `CResourceTable` 中把 ID 解析为本地 resource，并重新建立 notifier 关系。
+
+三条 mask setter 都遵循同一种 ABI 形状：
+
+```cpp
+// 三种 wire command 的归一化伪接口；类型名和字段名为本文重建名称。
+// dispatcher 已用 target resource ID 找到 this，所以这里只展示 handler 消费的 mask ID；
+// 不把该归一化视图当作原始 command struct 的逐字节布局。
+struct MILCMD_SHADOW_SETMASK
+{
+    uint32_t maskResource; // 0 表示 nullptr
+};
+
+HRESULT ProcessSetMask(
+    CResourceTable* resources,
+    MILCMD_SHADOW_SETMASK const* command)
+{
+    CBrush* newMask = command->maskResource == 0
+        ? nullptr
+        : resources->GetResource<CBrush>(command->maskResource);
+
+    RegisterNotifier(this, newMask);
+    UnregisterNotifier(this, this->maskBrush);
+    this->maskBrush = newMask;
+    InvalidateMaskContent();
+    return S_OK;
+}
+```
+
+对应入口为：
+
+```text
+CDropShadow::ProcessSetMask              @ 0x1800D2B50
+CProjectedShadowCaster::ProcessSetMask   @ 0x1800C93B8
+CProjectedShadowReceiver::ProcessSetMask @ 0x1800EC294
+```
+
+完整 ownership 边界是：
+
+```text
+XAML UIElement / ThemeShadow
+  -> Microsoft.UI.Composition object
+  -> composition channel command + resource ID
+  -> DWM CResourceTable lookup
+  -> CVisual / CBrush / CShadow resource
+  -> notifier-driven invalidation
+  -> draw-list / off-screen realization
+```
+
+这也解释了“内部类型有 mask 字段或 `ProcessSetMask`，public API 却未必有同名属性”：command ABI、DWM resource 能力和当前 public projection 是三个层次，不能从任一层单独推断另外两层都公开了相同接口。
+
+## visual、effect、clip、opacity 与 shadow 的合成顺序
+
+DWM 的 visual traversal 不是一条对所有 visual 都相同的线性管线。3D、preserve-3D、backdrop、tree-effect layer 和特殊 content producer 会分支。对普通 2D visual，最有用的概念顺序如下：
+
+```cpp
+HRESULT DrawVisual2D(CDrawingContext* dc, CVisual* visual)
+{
+    if (!ValidateAndCull(visual))
+        return S_OK;
+
+    PushLightsAttributionAndRenderOptions(visual);
+    D2D_RECT_F outputBounds = CalculateOutputBounds(visual);
+    EffectState effects = visual->GetEffects();
+    GeometryState geometry = ResolveVisualGeometryAndClip(visual);
+
+    PushWorldTransform(visual->transform);
+    PushCpuAndGpuClip(geometry.clip);
+    CalculateReverseEffectInputBounds(effects, outputBounds);
+    PushEffectsAndOpacity(effects, visual->opacity);
+
+    // ProjectedShadowDrawOrder == 1：receiver visual/subtree 之前。
+    visual->RenderProjectedShadows(/* drawOrder = */ 1);
+
+    DrawVisualContentAndChildren(visual);
+
+    // ProjectedShadowDrawOrder == 0：receiver visual/subtree 之后。
+    visual->RenderProjectedShadows(/* drawOrder = */ 0);
+
+    PopEffectsLayersClipTransformAndRenderState();
+    return S_OK;
+}
+```
+
+两个已确认的 projected-shadow 插入点分别在：
+
+```text
+CDrawingContext::PreSubgraph  @ 0x18003D754
+  -> CVisual::RenderProjectedShadows(drawOrder = 1) @ 0x1800C1AB4
+
+CDrawingContext::PostSubgraph @ 0x18003D4D8
+  -> CVisual::RenderProjectedShadows(drawOrder = 0) @ 0x1800C1AB4
+```
+
+这里的 `PushEffectsAndOpacity` 是概念合并名，不表示 clip、opacity 和每种 effect 必然共用一个 GPU pass。DWM 会根据 bounds、clip complexity、group opacity、effect topology 和 cache 条件决定 inline state、draw-list primitive 或 off-screen layer。稳定的关系是：visual transform/clip 决定 effect 输入和可见 bounds；需要隔离的 opacity/effect 形成 layer 或 intermediate；projected shadow 则按 receiver draw-order 在 visual subgraph 的前后插入独立绘制。
+
+`CDropShadow` 与此不同：它是 visual shadow/content path 的局部 effect，不使用 receiver 的 pre/post projected-shadow ordering。它先从 mask 生成 blurred coverage，再以 offset/color/opacity 合成，必要时通过 occlusion rect 避免被原 content 覆盖的区域产生无意义 overdraw。
+
+## alpha 与 color contract：shader 实际收到和必须返回什么
+
+颜色路径最容易混淆 public straight color、surface storage、shader body 参数和最终 blend contract。可将普通 effect technique 概括为：
+
+```cpp
+float4 ExecuteEffectPixel(PixelContext px)
+{
+    float4 effectColor;
+
+    if (body.kind == ShaderBodyKind::OrdinaryColor)
+    {
+        // PerformSample 建立 sample/extend fragments，再按该 input descriptor
+        // 应用 IgnoreAlpha、SDR unboost 和 source color conversion。
+        float4 source = PerformSampleAndColorModifications(px.uv, inputDesc);
+        effectColor = PSBody(source, dynamicConstants, /* other colors */);
+    }
+    else // custom sampler body
+    {
+        // custom export 自己采样；返回后才对 primary sampler descriptor
+        // 执行 AppendColorModifications。
+        effectColor = PSBodyCustom(px.uv, dynamicConstants, /* texture bindings */);
+        effectColor = AppendColorModifications(effectColor, primaryInputDesc);
+    }
+
+    effectColor = ApplyTechniqueLevelAlphaAndTargetConversion(effectColor);
+    return effectColor; // 进入 DWM 的 premultiplied-alpha composition/blend contract
+}
+```
+
+核心约束如下：
+
+```text
+public/API straight color
+  -> primitive opacity/coverage 应用
+  -> premultiplied rendering color
+  -> source surface sample
+  -> source color-space / SDR-HDR conversion
+  -> linked effect body
+  -> output color modification / target conversion
+  -> premultiplied output blend
+```
+
+`CDrawListPrimitive::UpdatePremultipliedColor @ 0x1800A2004` 展示了非纹理 primitive 的入口：
+
+```cpp
+void UpdatePremultipliedColor(
+    CDrawListPrimitive* primitive,
+    D3D_COLOR_F straightColor)
+{
+    float opacityOrCoverage = primitive->alpha;
+    D3D_COLOR_F effective = straightColor * opacityOrCoverage;
+    primitive->packedColor = ColorDWFromStraightColorF(effective);
+}
+```
+
+solid-color logical input 没有 texture SRV；其 `samplerData` 直接保存 premultiplied `float4`。texture input 的 `samplerData` 则保存有效 content rect 等 metadata，颜色来自 sample。两者虽然都能成为普通 color-body 的 `float4` input，底层 ABI 并不相同。
+
+颜色空间也不是 factory 的静态属性。`CDrawingContext::PushColorSpaceLayer @ 0x18003F3C0` 可以建立具有目标 color-space 语义的 layer；`CSurfaceDrawListBrush::IsColorConversionRequired @ 0x18008C980` 根据当前 source/target 决定是否需要转换；`ColorConversion::GetConversionShader @ 0x180099CCC` 选择 conversion fragment；`AppendColorConversion @ 0x1800A78B4` 把它插入 linked chain。target 或 surface color space 改变因此可能改变 `ShaderLinkingConfig` 和 shader-cache key，而不会改变 effect description graph。
+
+编写 custom body 时应遵守两个实际规则：
+
+1. 不要把输入无条件当作 straight-alpha RGBA；普通 composition surface 和 solid-color fast path 都按 premultiplied composition 语义进入后续链路。
+2. 返回值也应满足 premultiplied 输出：`rgb <= alpha` 是标准 coverage color 的有效域。若有意输出 additive/HDR 值，应把它视为特殊颜色运算，并验证 suffix 后追加的 alpha/color conversion 是否仍符合预期。
+
+custom sampler suffix 只编码 primary sampler 的 extend/sample/color-handling variant；它不是独立的 alpha ABI。suffix 选择、`PerformSample` 与 `AppendColorModifications` 的具体分工见后文对应章节。
+
+### opacity relevance 怎样变成 `CEffectBrush::isOpaque`
+
+WUCEffectsI 在 factory finalization 阶段只标记真正影响最终 alpha 的 named inputs。DWM 的 `CEffectBrush::CalculateIsOpaque @ 0x1800D4084` 消费这组结果：
+
+```cpp
+bool CEffectBrush::CalculateIsOpaque() const
+{
+    ICompiledEffect const* compiled = effectInstance->GetCompiledEffectNoRef();
+    if (!compiled->DoOpaqueInputsProduceOpaqueOutputs())
+        return false;
+
+    RectF unboundedRect = { 0.0f, 0.0f, +INFINITY, +INFINITY };
+
+    for (uint32_t i = 0; i != inputCount; ++i)
+    {
+        if (!compiled->IsInputOpacityRelevant(i))
+            continue;
+
+        CResource* input = inputResources[i];
+        RectF opaqueRect{};
+        if (input == nullptr ||
+            !input->IsOpaqueRect(unboundedRect, &opaqueRect) ||
+            opaqueRect != unboundedRect)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+```
+
+这里调用的真实接口入口是 `FlattenedEffectGraph::DoOpaqueInputsProduceOpaqueOutputs @ 0x1800121A0` 和 `IsInputOpacityRelevant @ 0x1800130B0`。这不是逐像素 alpha analysis，而是 conservative whole-brush proof：只有 compiled effect 声明 opaque inputs 可以产生 opaque output，并且每个被标为 relevant 的 input 都能证明整个请求域 opaque，`CEffectBrush +0xB8` 才置 1。未被 opacity relation 标记的 auxiliary input 不会阻止 opaque fast path。
+
+### visual opacity：直接乘 alpha 还是隔离成 layer
+
+`CDrawingContext::PushEffects @ 0x18004014C` 读取 `NodeEffects +0x24` 的 visual opacity。普通 2D 分支可以按以下决策理解：
+
+```cpp
+struct CDrawingContext::NodeEffects // partial；成员名为本文重建名称
+{
+    /* +0x00 */ CVisual* visual;
+    /* +0x08 */ CShapePtr localClip;                 // sizeof = 0x10
+    /* +0x18 */ CCpuClippingData* cpuClippingData;
+    /* +0x20 */ CompositionResampleMode::Enum resampleMode; // 0 表示无需 resample layer
+    /* +0x24 */ float opacity;
+    /* +0x28 */ CMILMatrix worldTransformSnapshot; // sizeof = 0x44
+    /* +0x6C */ CMILMatrix localClipTransform;     // sizeof = 0x44
+    /* +0xB0 */ CpuClippingScopeMode cpuClippingScopeMode;
+    /* +0xB4 */ uint32_t clipLayerFlags;
+    /* +0xB8 */ bool hasCpuClippingData;
+    /* +0xB9 */ bool hasColorTransform;
+    /* +0xBA */ bool hasFilterEffect;
+    /* +0xBB */ bool hasTreeEffect;
+    /* +0xBC */ bool hasExplicitColorSpace;
+    /* +0xBD */ bool canApplyOpacityDirectly;
+    /* +0xBE */ uint8_t trailingPadding_0xBE[0x02];
+}; // sizeof = 0xC0
+```
+
+```cpp
+HRESULT PushVisualClipEffectsAndOpacity(NodeEffects& state)
+{
+    if (abs(state.opacity) < 1.1920929e-6f)
+        return SkipCurrentVisualSubtree();
+
+    if (state.localClip != nullptr || state.opacity != 1.0f)
+        PushLocalSpaceClipAndAlphaInternal(state);
+
+    if (state.hasColorTransform)
+        PushColorTransformLayerForNode(state.visual);
+    if (state.hasFilterEffect)
+        PushEffectLayer(state.visual, ResolveFilterEffect(state.visual));
+    if (state.hasTreeEffect)
+        PushEffectLayer(state.visual, ResolveTreeEffect(state.visual));
+    if (state.resampleMode != 0)
+        PushResampleLayer(state.visual);
+    if (state.hasExplicitColorSpace)
+        PushColorSpaceLayer(state.visual);
+}
+```
+
+`PushLocalSpaceClipAndAlphaInternal @ 0x180040AA8` 再区分 direct-alpha 与 isolated-alpha：
+
+```cpp
+if (localClipIsSimpleOrAbsent && state.canApplyOpacityDirectly) // +0xBD，本文重建名称
+{
+    PushEffectiveAlphaForNode(state.visual, state.opacity);
+}
+else
+{
+    // complex clip 需要 D2D layer；不能直接下推的 group opacity 也保存在 layer opacity。
+    PushEffectiveAlphaForNode(
+        state.visual,
+        state.canApplyOpacityDirectly ? state.opacity : 1.0f);
+
+    PushD2DLayer(
+        optionalClipGeometry,
+        state.canApplyOpacityDirectly ? 1.0f : state.opacity);
+}
+```
+
+所以 visual opacity 并不总产生 off-screen texture。能安全下推时，它只是 effective-alpha stack 的一项，之后乘入 draw-list primitive；复杂 clip 或必须对已经组合好的 group 应用一次 opacity 时才建立 D2D layer。真正的 filter/tree effect 则由 `PushEffectLayer @ 0x18003FAE0` 创建 `CFilterEffectLayer` 或 `CTreeEffectLayer`，其大小还受当前 device 最大 texture size（此路径上限 clamp 到 `0x4000`）约束。
+
+### linked shader 的 `minBlend` 与最终 D3D blend state 不是同一层
+
+最终 draw 还携带独立的 `BlendMode::Enum`。`CSurfaceShaderComposer::RunShader @ 0x18007C10C` 按该值从 device state table 选择 blend state；batch path 的 `CD3DBatchExecutionContext::SetBlendMode @ 0x180099640` 在 mode 改变时 flush，并设置相同 table 中的对象：
+
+```cpp
+void SetBlendMode(BlendMode::Enum mode)
+{
+    if (mode == currentBlendMode)
+        return;
+
+    Flush(NeedsSpecialTransition(currentBlendMode, mode)
+        ? FlushReason::BlendClassChanged
+        : FlushReason::StateChanged);
+
+    if (mode != BlendMode::Enum(24))
+        context->OMSetBlendState(device->blendStates[mode], nullptr, 0xFFFFFFFF);
+
+    currentBlendMode = mode;
+}
+```
+
+这与 `ShaderLinkingConfig::minBlend @ +0x84` 不同：后者进入 linked-shader configuration，并参与 shader-side linking 分支和 shader cache key；`BlendMode::Enum` 是 draw/batch 的 output-merger state。二者可能同时存在，不能把 config 中的一个 bool 解释为完整 D3D blend mode。
+
+## clip、mask、opacity 与 effect coverage 的统一合同
+
+这四个概念都能让最终像素“变透明”，但数据形态和介入阶段不同：
+
+```cpp
+struct CoveragePipeline // 本文概念伪结构
+{
+    CShape* geometryClip;          // vector/rect coverage；CPU/GPU clip stack
+    CBrush* alphaMaskBrush;        // 可作为 composition/effect resource 的 sampled coverage
+    float effectiveOpacity;        // scalar，direct alpha stack 或 layer opacity
+    ICompiledEffect* colorEffect;  // 可同时改变 rgb、alpha、bounds 和 sampling footprint
+};
+```
+
+普通 visual 的概念顺序是：
+
+```text
+visual/local geometry
+  -> CPU bounds clip 与 GPU clip representation
+  -> 必要时以 D2D geometry layer rasterize complex clip
+  -> content/effect subtree rendering
+  -> direct effective alpha 或 isolated layer opacity
+  -> final BlendMode output merge
+```
+
+各自的精确边界如下：
+
+- geometry clip 是 `CShape`/rect 和 transform。axis-aligned rect 可保留为 clip bounds/GPU scissor-like state；复杂 shape 可能由 `CScopedClipStack`、`ID2D1Geometry` 和 D2D layer 实现。它通常不是 shader resource，因此 custom shader 不能把“当前 clip”当成 `Texture2D` 采样。
+- alpha mask 是 brush producer。作为 public `GetAlphaMask()` 或 effect named input 时，它能被 materialize 为 surface；作为 shadow private mask 时，它由 `CShadowMaskProducer` rasterize，应用不可寻址。
+- opacity 是 scalar coverage multiplier。direct path 不创建 mask bitmap；group-isolated path 把 opacity 放到 layer composite 上，也仍不等于一张可供 effect 读取的 mask。
+- effect 可以改变 alpha，也可以扩大 output bounds。reverse-bounds 先从可见 output 推导需要的 source capture；clip 再限制实际可见/rasterized 区域。因此“effect output 被 clip”不表示 effect 只需读取 clip 内部 source——blur 等邻域 effect 仍可能从 clip 外捕获 padding。
+
+`PushClipRectForCurrentNode @ 0x18003EF2C` 和 `PushClipShapeForCurrentNode @ 0x18003F15C` 最终都进入 `PushLocalSpaceClipAndAlphaInternal`。这解释了 clip 与 opacity 为什么共享一套 local-space layer decision，却仍是两种不同输入：clip 提供空间 coverage；opacity 只提供一个 scalar。
+
+可采样 mask 必须显式成为 brush/surface edge：
+
+```text
+current visual clip state  --X--> custom shader Texture2D
+visual effective opacity   --X--> custom shader Texture2D
+
+GetAlphaMask()/mask brush  ---> named input -> EffectInput -> physical surface
+```
+
+因此若 shader 需要 non-blurred element coverage、需要对 mask 做偏移采样，正确接口仍是显式传入 alpha-mask brush；依赖 visual clip 或 opacity stack 只能影响最终 rasterization，不能替代第二张纹理。
+
 ## ShaderLinkingBody
 
 每个 subgraph 的 shader body 用一个 48 字节结构描述：
@@ -3101,6 +3903,45 @@ struct ShaderLinkingBody
 ## Effect factory 的异步编译生命周期
 
 effect description 到 `ICompiledEffect` 的编译不一定发生在创建 factory 的调用线程。DWM 侧先把 serialized description 放进 `CCompiledEffectTemplate`，再交给 compilation service：
+
+### serialized description command：shared section slice，而不是 inline graph
+
+`CLocalComposition::ProcessMessage @ 0x180124160` 要求 `MILCMD_COMPILEDEFFECTTEMPLATE` packet 恰好为 `0x14` bytes，并预先验证 `+0x08` 引用 type 157 resource。wire layout 为：
+
+```cpp
+struct MILCMD_COMPILEDEFFECTTEMPLATE // 当前 channel ABI
+{
+    /* +0x00 */ MILCMD commandType;
+    /* +0x04 */ uint32_t targetCompiledEffectTemplateResourceId; // type 28
+    /* +0x08 */ uint32_t sharedSectionResourceId;                 // type 157
+    /* +0x0C */ uint32_t byteOffset;
+    /* +0x10 */ uint32_t byteCount;
+}; // sizeof = 0x14
+```
+
+type 157 resource 在当前路径向 handler 暴露：
+
+```cpp
+/* resource +0x50 */ uint32_t mappedByteSize;
+/* resource +0x58 */ uint8_t* mappedBytes;
+```
+
+`CCompiledEffectTemplate::ProcessUpdate @ 0x1800CF738` 使用防溢出的 slice 检查：
+
+```cpp
+if (command.byteOffset >= section.mappedByteSize ||
+    command.byteCount > section.mappedByteSize - command.byteOffset ||
+    section.mappedBytes == nullptr)
+{
+    return E_OUTOFMEMORY; // 当前实现用于 malformed/invalid slice 的实际 HRESULT
+}
+
+uint8_t const* bytes = section.mappedBytes + command.byteOffset;
+IEffectDescription* description =
+    DeserializeEffectDescription(bytes, command.byteCount);
+```
+
+这里 shared section 只负责把可能较大的 serialized graph 送入 DWM，不成为 compiled template 的长期 graph storage。反序列化在 composition thread 同步完成；随后 worker task 持有 `IEffectDescription*`。因此 command packet、resource-table lookup 和 shared-section slice 的 lifetime 不需要延伸到 threadpool compile 阶段。
 
 ```text
 CCompiledEffectTemplate::ProcessUpdate @ 0x1800CF738
@@ -3143,6 +3984,35 @@ CEffectCompilationTask* BeginCompile(
 
 `CBrushRenderingGraphBuilder::AddEffectBrush` 在消费 template 前也执行相同的 wait/close。这建立了明确边界：effect compilation 可以异步和去重，但 rendering graph 构建看到的一定是完整 `ICompiledEffect`，不会看到半生成的 subgraph vector、bytecode 或 updater records。
 
+### composition thread、worker 与 completion 的职责边界
+
+`ProcessUpdate` 显式检查当前线程必须是 `CComposition::s_compositionThreadId`，然后增加当前 channel 的 pending-effect-compilation count。各阶段拥有的数据为：
+
+```text
+composition thread / ProcessUpdate
+  owns: command validation、resource-table lookup、shared-section slice、
+        DeserializeEffectDescription、target/template registration
+  publishes: immutable/ref-counted IEffectDescription* into task
+
+threadpool Compile_WorkerThread
+  reads: IEffectDescription
+  creates: FlattenedEffectGraph、compiled subgraphs、ID3DBlob libraries、
+           ConstantBufferUpdater records、ICompiledEffect
+  does not create: CD3DPixelShader / ID3D11PixelShader
+
+render/composition completion
+  publishes: task HRESULT、restricted error、ICompiledEffect result
+  performs: target notification、pending count decrement、composition pass scheduling
+
+draw/device path
+  creates lazily: linked pixel-shader bytecode for ShaderLinkingConfig，
+                  then per-device CD3DPixelShader
+```
+
+worker 不接触 `CBrushRenderingGraph`、visual tree 或 device context；这些对象具有 composition/render-thread affinity。反过来，render thread 不观察 compiler 正在填充的 vectors：task result 只在 completion state 后发布。失败同样通过 completion target 返回 restricted error；它不是在 draw 时把一个半初始化 template 当作 transparent brush。
+
+如果 `BeginCompile` 在注册 task 时失败，`ProcessUpdate` 立即减少 pending count 并调度 composition pass。成功启动的 task 则由 completion path完成相同的 accounting。这个计数是 channel “所有 effect compilations 完成”信号的基础，不是 shader-cache entry count。
+
 这里存在三层不同缓存：
 
 ```text
@@ -3158,9 +4028,555 @@ CLinkedShader + CD3DDevice -> CD3DPixelShader / ID3D11PixelShader
 
 animated property value 不参与第一、第二层 key；它只进入 instance constant buffer。
 
+## effect factory / brush 的 command-resource ABI
+
+shadow 的 `ProcessSetMask` 只是同一套 resource-channel 模型的局部例子。effect 主路径由一个共享 template resource 和多个 brush-instance resources 组成：
+
+```text
+CompositionEffectFactory
+  -> serialized description command
+  -> CCompiledEffectTemplate
+  -> async shared ICompiledEffect
+
+CompositionEffectBrush instance
+  -> template resource ID
+  -> CPropertySet resource ID
+  -> indexed source resource IDs
+  -> CEffectBrush
+  -> per-brush IEffectInstance
+```
+
+### `CEffectBrush` 的实例字段
+
+当前 x64 build 的关键布局为：
+
+```cpp
+template<>
+struct DynArrayImpl<1> // partial layout；成员名为本文重建名称
+{
+    /* +0x00 */ void* data;
+    /* +0x08 */ void* initialBuffer;
+    /* +0x10 */ uint32_t initialCapacity;
+    /* +0x14 */ uint32_t capacity;
+    /* +0x18 */ uint32_t count;
+}; // sizeof = 0x1C
+
+// 真实 interface 名与 IID；它是 marker interface，没有额外 callback method。
+constexpr GUID IID_IBrushChangeNotification =
+    {0xdcb0a0af, 0xcd0d, 0x426f, {0x8c, 0xcb, 0x32, 0x6c, 0x78, 0xeb, 0x4a, 0x27}};
+struct IBrushChangeNotification : IUnknown
+{
+};
+
+// 本文重建名：当前符号没有给出这个单方法 callback interface 的原始类型名。
+struct IPropertySetValueChangeSink
+{
+    virtual HRESULT OnPropertyValueChanged(
+        uint32_t propertyIndex,
+        DCOMPOSITION_EXPRESSION_TYPE valueType,
+        void const* valueBytes) = 0;
+};
+
+struct CEffectBrush // partial；成员名为本文重建名称
+{
+    /* +0x00 */ CContent contentBase; // base subobject，sizeof = 0x48
+    /* +0x48 */ IBrushChangeNotification brushChangeNotification; // secondary base subobject
+    /* +0x50 */ CBrushRenderingGraph* brushGraph;
+    /* +0x58 */ IUnknown* activeChangeSource; // notification recursion guard
+    /* +0x60 */ bool usesBrushRenderingGraph;
+    /* +0x61 */ uint8_t alignmentPadding_0x61[0x07];
+    /* +0x68 */ IPropertySetValueChangeSink propertySetValueChangeSink;
+    /* +0x70 */ CCompiledEffectTemplate* compiledTemplate; // notifier-held
+    /* +0x78 */ CPropertySet* propertySet;                 // ref-counted
+    /* +0x80 */ IEffectInstance* effectInstance;           // ref-counted
+    /* +0x88 */ DynArrayImpl<1> inputResources;            // element stride = 8，元素为 CResource*
+    /* +0xA4 */ uint32_t alignmentPadding_0xA4;
+    /* +0xA8 */ CResource* inlineInputResources[2];
+    /* +0xB8 */ bool isOpaque; // EnsureBrushGraph 写入
+    /* +0xB9 */ uint8_t trailingPadding_0xB9[0x07];
+}; // sizeof = 0xC0
+```
+
+`CEffectBrush` 的 primary vtable 仍是 `CContent/CBrush` 主虚表；`+0x48` 和 `+0x68` 才是额外 subobject。当前 effect 路径实际消费的主虚表后缀可以集中写成：
+
+```cpp
+struct CBrushEffectPathVtableView // selected slots；名称来自当前 symbols
+{
+    /* +0xB0 */ bool (*OnChanged)(CBrush*, NotificationEventArgs::Flags, IUnknown* source);
+    /* +0xB8 */ HRESULT (*GetBounds)(CBrush const*, D2D_SIZE_F const&, D2D_RECT_F*);
+    /* +0xC0 */ HRESULT (*AddOcclusionInformation)(CBrush*, COcclusionContext*, D2D_SIZE_F const&);
+    /* +0xC8 */ HRESULT (*Draw)(CBrush*, CDrawingContext*, D2D_SIZE_F const&, CDrawListCache*);
+    /* +0xD0 */ HRESULT (*HitTest)(CBrush const*, D2D_SIZE_F const&, D2D_POINT_2F const&, bool*);
+    /* +0xD8 */ bool (*IsEmptyDrawing)(CBrush const*);
+
+    // +0xE0/+0xE8 是 CContent 的通用 capability slots；当前 effect path 不读取它们，
+    // 且实现被 identical-code folding 到恒真/恒假函数，当前 symbols 未保留可用的原始槽名。
+
+    /* +0xF0 */ bool (*IsDrawListCacheDirty)(CBrush*, CDrawListCache*,
+                                             CDrawingContext*, D2D_SIZE_F const&);
+    /* +0xF8 */ HRESULT (*GenerateDrawList)(CBrush*, CDrawingContext*,
+                                            D2D_SIZE_F const&, CDrawListCache*);
+    /* +0x100 */ LiftedOverlayType (*GetLiftedOverlayType)(CBrush const*);
+    /* +0x108 */ bool (*HasCompositionSurface)(CBrush const*);
+    /* +0x110 */ bool (*HasSwapChainContent)(CBrush const*);
+    /* +0x118 */ bool (*HasRenderingIntermediate)(CBrush const*);
+    /* +0x120 */ HRESULT (*GetTextureMemoryLayoutData)(
+        CBrush const*, D2D_SIZE_F const&, std::vector<CContent::LayoutData>&);
+    /* +0x128 */ void (*ComputeBackgroundBlendInfo)(CBrush const*, bool*, bool*);
+    /* +0x130 */ ContentBackdropFlags (*GetBackdropFlags)(CBrush const*);
+    /* +0x138 */ bool (*IsReadyToDraw)(CBrush const*, CDrawingContext*, bool*);
+    /* +0x140 */ bool (*IsOpaqueRect)(CBrush const*, D2D_SIZE_F const&, D2D_RECT_F*);
+    /* +0x148 */ bool (*ShouldSnapToPixels)(CBrush const*);
+    /* +0x150 */ HRESULT (*GetBrushParameters)(CBrush const*, CBrushDrawListGenerator*);
+    /* +0x158 */ HRESULT (*EnsureBrushGraph)(CBrush*, bool validateOnly);
+    /* +0x160 */ HRESULT (*CreateLayoutGeometryDrawListBrush)(
+        CBrush const*, CDrawingContext*, D2D_SIZE_F const&, CDrawListBrush**);
+};
+```
+
+这组槽解释了两个容易混淆的入口：`Draw/GenerateDrawList` 属于通用 content cache 与 emission 层；`GetBrushParameters/EnsureBrushGraph` 才把具体 brush 转成 draw-list inputs 或 `CBrushRenderingGraph`。`CEffectBrush::GetBrushParameters` 读取已经建立的 graph，`EnsureBrushGraph` 则负责 build/rebuild 并更新 `isOpaque`。`IsOpaqueRect`、`GetBackdropFlags` 和三个 surface/intermediate capability query 会在真正执行 shader 前参与 opaque proof、BVI/backdrop 选择与 texture-memory accounting。
+
+`CResourceFactory::Create @ 0x180120C10` 的 effect-brush 分支把 `inputResources.data` 和 `inputResources.initialBuffer` 都初始化为 `CEffectBrush +0xA8`，并把 `initialCapacity`、`capacity` 都设为 2。因此前两个 source slot 直接放在对象尾部；超过 2 个 slot 才由 `DynArrayImpl` 切到 heap buffer。`+0xA4` 只是把这个内联指针数组重新对齐到 8 字节边界，并不是隐藏的 input count。
+
+`activeChangeSource` 由 `CBrush::NotifyOnChanged @ 0x1800B08C0` 临时写入，用来阻止同一条 brush 通知链重入，通知结束马上清零。`usesBrushRenderingGraph` 在当前 brush 构造路径中初始化为 true；`CBrush::Draw @ 0x1800B03B0` 只有在它为 true 且 graph 尚未建立时才调用虚拟 `EnsureBrushGraph`。所以 `+0x58..+0x67` 是 `CBrush` 的公共状态，不是 effect template 的未知 payload。
+
+`compiledTemplate` 和每个非空 input 用 `CResource::RegisterNotifier` 建立依赖；`propertySet` 使用 ref count，并把 `propertySet +0x50` 指回 `CEffectBrush +0x68` 的 property-value callback subobject。当前符号能确认该 subobject 只有 `OnPropertyValueChanged` 这一虚方法，但没有暴露 interface 的原始类型名，因此上面的 `IPropertySetValueChangeSink` 明确是本文重建名。三者不是同一种 ownership。
+
+### `IBrushChangeNotification` 是 brush identity marker，不是 change callback
+
+`CBrush::HrFindInterface @ 0x180015F80` 对上面的 IID 返回 `this + 0x48`。该 secondary subobject 的虚表恰好只有标准 `IUnknown` 三槽：
+
+```cpp
+struct IBrushChangeNotificationVtable
+{
+    /* +0x00 */ HRESULT (*QueryInterface)(IBrushChangeNotification*, REFIID, void**);
+    /* +0x08 */ ULONG (*AddRef)(IBrushChangeNotification*);
+    /* +0x10 */ ULONG (*Release)(IBrushChangeNotification*);
+};
+
+// 三个 adjustor thunk 的共同形状：
+CBrush* RecoverPrimaryBrush(IBrushChangeNotification* marker)
+{
+    return reinterpret_cast<CBrush*>(
+        reinterpret_cast<uint8_t*>(marker) - 0x48);
+}
+```
+
+这里没有 `OnBrushChanged`。真正的 change entry 是 `CResource::NotifyOnChanged` / `CBrush::NotifyOnChanged`；marker 的作用只是让一个沿 notifier graph 传递的 `IUnknown*` 可以被识别为 brush，并通过固定的 `-0x48` this adjustment 找回 primary `CBrush*`。
+
+当前虚表符号显示为 `CCompositionMagnifierBrush::{for IBrushChangeNotification}`，但 `CEffectBrush`、gradient/surface/mask brush 等许多构造器都写入同一个虚表地址。这是共享/折叠后的通用 secondary-interface 虚表，并不表示这些 brush 继承自 `CCompositionMagnifierBrush`。
+
+`CBrushRenderingGraph::AdjustNotification @ 0x1800E83BC` 会沿 `activeChangeSource` 构成的链逐项执行：
+
+```cpp
+bool ChangeCameFromBrushUsedByEarlierStage(
+    CBrushRenderingGraph const& graph,
+    IUnknown* source)
+{
+    while (source != nullptr)
+    {
+        com_ptr<IBrushChangeNotification> marker;
+        if (FAILED(source->QueryInterface(IID_IBrushChangeNotification, marker.put())))
+            break;
+
+        CBrush* changedBrush = RecoverPrimaryBrush(marker.get());
+        if (graph.AnEarlierStageUsesBrush(changedBrush))
+            return true;
+
+        source = changedBrush->activeChangeSource;
+    }
+    return false;
+}
+```
+
+因此 `activeChangeSource` 同时承担两件事：最外层 `NotifyOnChanged` 用非空值阻止递归重入；rendering graph 则把它当作一条短暂的 change-origin parent chain，判断某个内部输入 brush 是否影响已经 materialize 的较早 stage。命中后，普通 reason 1 会升级为 reason 6。
+
+### `+0x68` callback 与 `CEffectPropertyChangeNotification` 是两种不同合同
+
+`IPropertySetValueChangeSink` 不是 COM interface。它的虚表只有一个 `OnPropertyValueChanged` 槽，没有 `QueryInterface/AddRef/Release`。`CPropertySet +0x50` 保存的是 raw callback pointer；`CEffectBrush::ReleaseResources` 必须先把它清零，再 release property set。调用时的 `this` 指向 owner 的 `+0x68`，所以实现中的相邻访问可以还原为：
+
+```cpp
+HRESULT IPropertySetValueChangeSink::OnPropertyValueChanged(...)
+{
+    CEffectBrush* owner = reinterpret_cast<CEffectBrush*>(
+        reinterpret_cast<uint8_t*>(this) - 0x68);
+
+    // this + 0x08 == owner + 0x70
+    CCompiledEffectTemplate* compiledTemplate = owner->compiledTemplate;
+    // this + 0x18 == owner + 0x80
+    IEffectInstance* effectInstance = owner->effectInstance;
+    // ... map property path, update instance, then notify the brush graph ...
+}
+```
+
+属性写入完成后，`CEffectBrush::OnPropertyValueChanged` 又在栈上建立一个真正支持 `IUnknown` 的 `CEffectPropertyChangeNotification`：
+
+```cpp
+// concrete class 名为真实符号；字段名为本文重建名称。
+struct CEffectPropertyChangeNotification
+{
+    /* +0x00 */ void* vftable;
+    /* +0x08 */ IEffectInstance* effectInstance; // borrowed for synchronous notification
+    /* +0x10 */ uint32_t changedNodeIndex;
+    /* +0x14 */ uint8_t alignmentPadding_0x14[0x04];
+
+    // vtable +0x00: QueryInterface
+    // vtable +0x08: AddRef，固定返回 1
+    // vtable +0x10: Release，固定返回 1
+    // vtable +0x18: GetChange(uint32_t* nodeIndex) -> IEffectInstance*
+}; // sizeof = 0x18
+```
+
+它接受 `IUnknown` 和下面这个 effect-change IID：
+
+```cpp
+constexpr GUID IID_IEffectPropertyChangeNotification =
+    {0x199a9f50, 0x25a6, 0x41d5, {0xb2, 0xa5, 0x91, 0x9a, 0x20, 0xcf, 0x4f, 0xb9}};
+```
+
+`AddRef/Release` 不管理生命周期，因为对象只在同步的 `NotifyOnChanged` 调用栈内存在。`AdjustNotification` 若不能把 source 识别成 brush marker，就查询这个 IID，取得 `(effectInstance, changedNodeIndex)`，再用 `CRenderingTechniqueFragment::ContainsEffectSubgraph` 判断改变是否落在较早 fragment。也就是说：
+
+```text
+IBrushChangeNotification
+  = “这个 notification source 可以还原成 CBrush” 的 identity marker
+
+IPropertySetValueChangeSink（本文重建名）
+  = CPropertySet -> CEffectBrush 的长期 raw callback
+
+CEffectPropertyChangeNotification
+  = CEffectBrush -> rendering graph 的一次性、栈上 change descriptor
+```
+
+### notifier edge、强引用与 notification reason
+
+`CResource::RegisterNotifier @ 0x1800251A4` 的参数方向容易读反。调用：
+
+```cpp
+owner->RegisterNotifier(dependency);
+```
+
+建立的是：
+
+```text
+dependency.listeners += owner
+dependency.AddRef()
+```
+
+notifier 相关字段位于 dependency 的 `CResource` base：
+
+```cpp
+/* CResource +0x20 */ CPtrArrayBase listeners;       // tagged empty/one/heap storage
+/* CResource +0x28 */ uint32_t notificationState;    // generation/reentrancy-coalescing bits
+```
+
+注销方向相反：
+
+```cpp
+void CResource::UnRegisterNotifierInternal(CResource* dependency)
+{
+    if (dependency != nullptr && dependency->listeners.Remove(this))
+        dependency->Release();
+}
+```
+
+所以 notifier edge 是一条由 owner 持有 dependency 的强生命周期边，同时让 dependency 知道应该通知哪些 owners。它不对 owner 加引用；owner 析构或替换字段时必须主动 unregister，否则 dependency 的 listener list 会留下悬空指针。effect brush 的 template 与每个 input 使用这种 ownership，property set 则是另一套 ref-count + raw callback 合同。
+
+`NotificationEventArgs::Flags` 虽然类型名叫 `Flags`，当前 brush 路径主要把它当作离散 reason code，而不是任意 OR 的 bitmask。下面只列已由 producer/consumer 双向确认的子集；枚举项名称为本文重建名称：
+
+```cpp
+enum class NotificationEventArgs::Flags : uint32_t
+{
+    DefaultResourceChange       = 0,
+    FinalEffectValueChanged     = 1,
+    VisualContentPreChange      = 5,
+    BoundsOrGraphChange         = 6,
+    BrushGraphStructureChanged = 14,
+};
+```
+
+传播层次为：
+
+```cpp
+void CResource::NotifyOnChanged(Flags reason, IUnknown* source)
+{
+    if (!EnterNotificationOrCoalesceNestedChange(notificationState))
+        return;
+
+    if (OnChanged(reason, source))
+        for (CResource* listener : listeners)
+            NotifyListenerOfChange(listener, reason, source);
+
+    LeaveNotification(notificationState);
+}
+
+void CResource::NotifyListenerOfChange(
+    CResource* listener,
+    Flags reason,
+    IUnknown* source)
+{
+    listener->NotifyOnChanged(reason, source);
+}
+```
+
+`OnChanged @ vtable +0xB0` 是传播前的 resource-specific gate。`CEffectBrush::OnChanged @ 0x1800D4AB0` 会先尝试创建/刷新 `IEffectInstance`，并且只有 template 已经具有 compiled state 时才允许通知继续传播。因此 async template 的中间状态不会被误当成可绘制 effect change。
+
+`CBrush::NotifyOnChanged @ 0x1800B08C0` 再按 reason 处理 rendering graph：
+
+```cpp
+void CBrush::NotifyOnChanged(Flags reason, IUnknown* source)
+{
+    if (activeChangeSource != nullptr)
+        return; // 同一 brush notification chain 的重入被合并
+
+    if (source == nullptr || source != static_cast<IUnknown*>(this))
+        activeChangeSource = source;
+
+    if (brushGraph != nullptr)
+    {
+        if (reason == BrushGraphStructureChanged)
+            DisposeAndRelease(brushGraph);
+        else if (reason == FinalEffectValueChanged)
+            brushGraph->AdjustNotification(&reason, this); // 可能升级为 6
+    }
+
+    CResource::NotifyOnChanged(reason, this);
+    activeChangeSource = nullptr;
+}
+```
+
+其中各 reason 的稳定语义是：
+
+- `0`：默认 resource 内容变化；保持现有 brush graph 对象，由下游按普通 dirty 路径处理。
+- `1`：effect 最终 node 的普通 animated value 变化；先尝试保留 graph。若 change descriptor 表明较早 fragment/node 受影响，升级为 `6`。
+- `5`：`CContent::NotifyListenerOfChange @ 0x1800B16F0` 在 reason `0` 发往 type 184 visual 前额外发送的 pre-change 通知，用于 visual/content 关系的专门失效。
+- `6`：source transform、非最终 node、bounds 或 graph-dependent 状态变化；需要下游重新评估更广的空间与 fragment 依赖，但不等同于立即销毁 brush graph。
+- `14`：brush source/topology 结构变化；`CBrush` 立即 dispose/release 当前 graph。`ProcessSetInput` 使用的就是该 reason。
+
+`CBrush::NotifyListenerOfChange @ 0x1800B0850` 还会过滤 `14`：listener 若不是 type 17 brush，就把它降为 `0`；brush-to-brush edge 才保留“graph structure changed”语义。这样 topology invalidation 沿嵌套 brush tree 传播，但 visual、mask producer 等非 brush listeners 只接收普通 content dirty，不会错误地解释另一个 brush 的私有 graph 生命周期。
+
+### template command：先固定 input array 形状，再创建 instance
+
+`CEffectBrush::ProcessSetTemplate @ 0x1800D4E38` 消费的字段位于 command `+0x08/+0x0C`：
+
+三条 effect-brush command 共享同一个 8-byte resource-command header。`CLocalComposition::ProcessMessage @ 0x180124160` 先检查完整 packet size，再用 `+0x04` 查找 type 57 的目标 `CEffectBrush`，最后才把原 packet 指针交给 handler。因此 `+0x00/+0x04` 不是未知 padding：
+
+```cpp
+struct MIL_RESOURCE_COMMAND_HEADER // 本文重建名称
+{
+    /* +0x00 */ MILCMD commandType;
+    /* +0x04 */ uint32_t targetResourceId;
+};
+```
+
+下面各结构把 header 展开书写，是为了让每个 wire offset 一眼可见。
+
+```cpp
+// 名称为本文重建；数值是当前 handler 返回的真实 HRESULT。
+constexpr HRESULT EffectBrushAlreadyInitialized = static_cast<HRESULT>(0x88980402u);
+constexpr HRESULT InvalidEffectBrushResourceOrIndex = static_cast<HRESULT>(0x88980403u);
+
+struct MILCMD_EFFECTBRUSH_SETTEMPLATE // partial
+{
+    /* +0x00 */ MILCMD commandType;
+    /* +0x04 */ uint32_t targetEffectBrushResourceId;
+    /* +0x08 */ uint32_t templateResourceId; // resource type 28
+    /* +0x0C */ uint32_t namedInputCount;
+};
+
+HRESULT CEffectBrush::ProcessSetTemplate(
+    CResourceTable* resources,
+    MILCMD_EFFECTBRUSH_SETTEMPLATE const* command)
+{
+    CCompiledEffectTemplate* newTemplate =
+        resources->GetResource<CCompiledEffectTemplate>(
+            command->templateResourceId);
+
+    if (newTemplate == nullptr)
+    {
+        ReleaseResources();
+        InvalidateBrush();
+        return S_OK;
+    }
+
+    if (compiledTemplate != nullptr)
+        return EffectBrushAlreadyInitialized;
+
+    RegisterNotifier(this, newTemplate);
+    compiledTemplate = newTemplate;
+    inputResources.resize(command->namedInputCount, nullptr);
+    TryCreateEffectInstance();
+    InvalidateBrush();
+    return S_OK;
+}
+```
+
+template 只能设置一次；空 template 则执行完整 `ReleaseResources`。`namedInputCount` 决定 `inputResources` 数组长度，后续 `SetInput` 只能替换已有槽，不能扩容 graph 的 source parameter 数量。
+
+### input command：按 index 替换 notifier edge
+
+`CEffectBrush::ProcessSetInput @ 0x1800D4C50` 的 wire fields 为：
+
+```cpp
+struct MILCMD_EFFECTBRUSH_SETINPUT // partial
+{
+    /* +0x00 */ MILCMD commandType;
+    /* +0x04 */ uint32_t targetEffectBrushResourceId;
+    /* +0x08 */ uint32_t inputIndex;
+    /* +0x0C */ uint32_t resourceId; // 0/未找到可表示 null
+};
+
+HRESULT CEffectBrush::ProcessSetInput(
+    CResourceTable* resources,
+    MILCMD_EFFECTBRUSH_SETINPUT const* command)
+{
+    if (compiledTemplate == nullptr)
+        return S_OK;
+
+    CResource* newInput = resources->GetResourceWithoutType(command->resourceId);
+    if (newInput != nullptr && !IsValidInputResource(newInput))
+        return InvalidEffectBrushResourceOrIndex;
+    if (command->inputIndex >= inputCount)
+        return InvalidEffectBrushResourceOrIndex;
+
+    CResource*& slot = inputResources[command->inputIndex];
+    UnregisterNotifier(this, slot);
+    slot = newInput;
+    RegisterNotifier(this, slot);
+    InvalidateBrush(/* reason = */ 14);
+    return S_OK;
+}
+```
+
+`GetResourceWithoutType` 是有意的：effect input 不只允许 `CBrush`。`IsValidInputResource @ 0x1800D49B8` 接受八类 DWM resources，包括普通 brush/content producer、special backdrop/source resources 和可作为 effect input 的 composition surfaces；具体 resource-type number 是 channel ABI，不应压缩成“只接受 brush pointer”。
+
+### property-set command 与 animated-property callback
+
+`CEffectBrush::ProcessSetPropertySet @ 0x1800D4D58` 从 command `+0x08` 取得 type 124 的 `CPropertySet`：
+
+```cpp
+struct MILCMD_EFFECTBRUSH_SETPROPERTYSET // partial
+{
+    /* +0x00 */ MILCMD commandType;
+    /* +0x04 */ uint32_t targetEffectBrushResourceId;
+    /* +0x08 */ uint32_t propertySetId; // resource type 124
+};
+```
+
+property set 同样只能安装一次。template 的 async state 准备好以后，`TryCreateEffectInstance @ 0x1800D51B4` 把 `CCompiledEffectTemplate::GetCompiledEffectNoRef()` 交给当前 `IEffectInstance`。property value 改变时调用：
+
+```text
+CPropertySet::PropertyUpdated
+  -> CEffectBrush::OnPropertyValueChanged @ 0x1800D4AF0
+  -> property-path index / expression type / bytes
+  -> IEffectInstance::SetAnimatableProperty
+  -> CEffectPropertyChangeNotification
+  -> brush invalidation reason 1 或 6
+```
+
+reason 1 对应最终 node 上、不改变 source transform 的普通 value change。若被写入的是 `EffectType::IsInputTransform` 指定的 transform property，`SetAnimatableProperty` 会把 `surfaceTransformChanged` 置 true，并同步更新 `EffectInstance::SurfaceData`；或者 changed node 不是 graph 最终 node时，DWM 使用更强的 reason 6，使 bounds、下游 fragment 与 rendering-graph 依赖一并重新评估。这里两个 out parameters 的准确含义是 `(surfaceTransformChanged, changedNodeIndex)`，不是“value was clamped”和“changed subgraph”。
+
+### release 顺序解释了 template、instance 和 inputs 的生命周期
+
+`CEffectBrush::ReleaseResources @ 0x1800D5038` 的顺序为：
+
+```cpp
+void CEffectBrush::ReleaseResources()
+{
+    DisposeAndRelease(brushGraph);
+
+    if (propertySet != nullptr)
+        propertySet->effectBrushCallback = nullptr;
+    Release(propertySet);
+
+    for (CResource*& input : inputResources)
+    {
+        UnregisterNotifier(this, input);
+        input = nullptr;
+    }
+    inputResources.clear_and_shrink();
+
+    Release(effectInstance);
+    UnregisterNotifier(this, compiledTemplate);
+    compiledTemplate = nullptr;
+}
+```
+
+所以 source brush 被替换或销毁时，旧 notifier edge 会先断开；template 失效会让 brush graph/instance 一起释放；多个 effect brushes 仍可共享同一个 compiled template，但各自保存独立 property set、input array、effect instance 和 brush graph。
+
 ## DWM 如何把 effect brush 变成 rendering graph
 
 `CBrushRenderingGraphBuilder::AddEffectBrush` 是 `IEffectInstance` / `ICompiledEffect` 进入 DWM rendering graph 的关键函数。instance 提供每个 brush 的动态数据，compiled effect 提供共享的 subgraph topology 和 shader bodies。
+
+### `CBrushRenderingGraph` 的实体布局与 ownership
+
+当前普通 graph 由 `CBrushRenderingGraphBuilder::Build @ 0x180110550` 分配为 `0xD8` bytes。两个 `DynArrayImpl` 都使用对象内 inline buffer：graph inputs 内联 4 项，techniques 内联 1 项。
+
+```cpp
+struct CBrushRenderingGraph::GraphInputParameters // 字段名为本文重建名称
+{
+    /* +0x00 */ CBrush* brush;                 // borrowed
+    /* +0x08 */ IEffectInstance* effectInstance; // optional，borrowed
+    /* +0x10 */ uint32_t surfaceIndex;
+    /* +0x14 */ uint32_t alignmentPadding_0x14;
+}; // sizeof = 0x18
+
+struct CBrushRenderingGraph // 当前普通 graph 布局；字段名为本文重建名称
+{
+    /* +0x00 */ void* vftable;
+    /* +0x08 */ uint32_t refCount;
+    /* +0x0C */ uint32_t alignmentPadding_0x0C;
+
+    /* +0x10 */ DynArrayImpl<1> graphInputs;
+    /* +0x2C */ uint32_t alignmentPadding_0x2C;
+    /* +0x30 */ GraphInputParameters inlineGraphInputs[4];
+
+    /* +0x90 */ DynArrayImpl<1> techniques; // elements are CRenderingTechnique*
+    /* +0xAC */ uint32_t alignmentPadding_0xAC;
+    /* +0xB0 */ CRenderingTechnique* inlineTechniques[1];
+
+    /* +0xB8 */ CShaderCache* shaderCache;
+    /* +0xC0 */ uint32_t shaderCacheModeFlags;
+    /* +0xC4 */ bool hasIntermediateUsedByBlur;
+    /* +0xC5 */ bool hasBlurredWallpaperBackdropInput; // type 15
+    /* +0xC6 */ bool hasWindowBackdropInput;           // type 191
+    /* +0xC7 */ bool ownsShaderCache;
+    /* +0xC8 */ bool disposed;
+    /* +0xC9 */ uint8_t alignmentPadding_0xC9[0x07];
+    /* +0xD0 */ CBackdropBrush* firstBackdropInputBrush; // borrowed；type 9
+}; // sizeof = 0xD8
+```
+
+`GraphInputParameters` 的 equality key 是三个值 `(brush, effectInstance, surfaceIndex)`。同一 tuple 只占一个 graph input slot；fragment input 保存的是该 slot 的 index。`effectInstance` 非空时，render-time `GetInputBrushParameters` 从 `effectInstance->GetSurfaceTransform(surfaceIndex)` 取得额外 3x2 transform，再与 input brush 生成的 draw-list brush transform 合成。
+
+这些 graph-input pointers 是 borrowed references。其 lifetime 由外层 resource/notifier tree 保证，不由 graph 单独 `AddRef`；这也解释了为什么 `Dispose` 的首要动作是立即清空 graph input count，避免已失效 graph 继续保留可访问的旧 identity：
+
+```cpp
+void CBrushRenderingGraph::Dispose()
+{
+    graphInputs.count = 0;
+    graphInputs.ShrinkToSize(sizeof(GraphInputParameters));
+    disposed = true;
+}
+```
+
+`Dispose @ 0x1800E8B5C` 不等于析构：它不删除 techniques，也不释放 shader cache，只切断 graph-input view 并让所有继续执行该 graph 的路径 fail-fast。调用者随后通常把 graph pointer Release/置空；真正析构 `@ 0x1800E8140` 才逐项执行：
+
+```cpp
+if (ownsShaderCache)
+    delete shaderCache;
+
+for (CRenderingTechnique* technique : techniques)
+{
+    technique->~CRenderingTechnique();
+    operator delete(technique, sizeof(CRenderingTechnique)); // 0x118
+}
+```
+
+若所有 fragments 可以共享已有 unique shader cache，`EnsureShaderCache @ 0x180111034` 把 `shaderCache` 指向 borrowed cache，并保持 `ownsShaderCache = false`；否则 graph 自己分配 cache，置 `ownsShaderCache = true`。因此 graph 析构不能无条件删除 `+0xB8`。
+
+每个 technique pointer 则由 graph 独占。`CRenderingTechnique::~CRenderingTechnique @ 0x1800E8260` 销毁 per-device constant-buffer table、释放 retained execution object，并删除它独占的 `CRenderingTechniqueFragment`。fragment 在 builder 阶段使用 `unique_ptr` 传入 technique；一旦 `CreateTechniqueForFragment` 成功，ownership 就不再留在 builder 临时对象中。
+
+`CheckBackdropInputs @ 0x1801107A8` 在 build 尾声扫描所有 technique fragments，写入 `+0xC4..+0xC6` 的快速 capability 汇总，并保存第一个 `CBackdropBrush` input。`GatherEffectInputs` 随后分别用这些字段准备普通 backdrop/BVI、blurred-wallpaper 和 window-background-treatment 三种特殊 `EffectInput`。它们是 graph-level execution shortcuts，不是 shader-linking config，也不参与 factory topology。
 
 它的高层逻辑是：
 
@@ -4360,7 +5776,7 @@ technique 是一次实际 draw/pass 的边界。
 
 `CompiledEffectSubgraphFlags` 不只控制 fragment output。flags 从 `CompiledEffectSubgraph +0x00` 进入 `CRenderingTechniqueFragment +0x1C`；创建 technique 时，`CollectStateFromAllFragments @ 0x18017B330` 把整条 fragment chain 的 flags OR 到 `CRenderingTechnique +0x108`。
 
-当前 build 中已能确认四个低位的消费方式。`CompiledEffectSubgraphFlags` 是真实类型名；下面的 enum member 名是本文根据生成点和消费点重建的语义名，不是当前 symbols 给出的原始成员拼写：
+当前 build 中已能确认六个低位的生成或消费方式。`CompiledEffectSubgraphFlags` 是真实类型名；下面的 enum member 名是本文根据生成点和消费点重建的语义名，不是当前 symbols 给出的原始成员拼写：
 
 ```cpp
 enum class CompiledEffectSubgraphFlags : uint32_t
@@ -4369,6 +5785,8 @@ enum class CompiledEffectSubgraphFlags : uint32_t
     ConditionalAuxiliaryBinding = 0x2,
     ForceAuxiliaryBinding       = 0x4,
     KeepFragmentOutput          = 0x8,
+    ReserveWhiteNoiseConstant   = 0x10,
+    DisallowSdrBoostConversionElision = 0x20,
 };
 
 bool HasFlag(
@@ -4423,9 +5841,16 @@ render target -> texture input
 
 这也是 flags 会影响采样能力、尺寸、padding 和 profile 隔离的原因。
 
-### `0x2 / 0x4`：technique-level auxiliary binding
+### `0x2 / 0x4`：lighting auxiliary binding
 
-这两个 bit 在 WUCEffectsI 当前普通 effect compiler 中没有写入点，但 DWM 自己构造的 fragment 或其它 private producer 可以传入。它们被 OR 到 technique flags 后，`CBrushRenderingEffect::SetStateOnDevice @ 0x180182B10` 使用：
+这两个 bit 的 producer 是 `EffectType` 虚表：
+
+```text
+EffectType +0x48 -> flag 0x2：SceneLightingEffect
+EffectType +0x40 -> flag 0x4：Point/Spot Diffuse/Specular
+```
+
+它们被 OR 到 technique flags 后，`CBrushRenderingEffect::SetStateOnDevice @ 0x180182B10` 使用：
 
 ```cpp
 if ((HasFlag(techniqueFlags, ConditionalAuxiliaryBinding) &&
@@ -4439,9 +5864,31 @@ if ((HasFlag(techniqueFlags, ConditionalAuxiliaryBinding) &&
 }
 ```
 
-所以它们属于 technique execution state，而不是 graph topology。`0x2` 带有额外的 lights-mask 条件，`0x4` 则无条件请求该 auxiliary binding。当前函数没有把这两个 bit 分别命名成公开的 lighting/white-noise enum，文中保留按实际 binding 行为命名，避免把共享 auxiliary resource 错写成某一个 effect 专属资源。
+所以它们属于 technique execution state，而不是 graph topology。`0x2` 带有额外的 lights-mask 条件，`0x4` 则无条件请求同一 auxiliary resource；producer effect 不同，但最终绑定的是相同的 PS SRV/CB slots。
 
-整体上四个 bit 分属三层：
+### `0x10`：WhiteNoise 的保留 sampler constant
+
+只有 `WhiteNoiseEffectType +0x50` 产生 `0x10`。`SetStateOnDevice` 在 technique 带该位且普通 surface count 小于 4 时，把 `CBrushRenderingEffect` sampler-constant 区域中的保留 scalar 维持为 `1.0f`；否则清为 `0.0f`，并在值变化时标记 constants dirty。
+
+这个 bit 不会凭空增加第五个 physical sampler。它允许 WhiteNoise codegen 复用四槽常量布局中的保留状态；一旦四个普通 surface slots 已全部占用，就不能再启用该保留路径。
+
+### `0x20`：禁止省略末端 SDR boost conversion
+
+`EffectType +0x60` 为真时，`EmitNode` 产生 `0x20`。`SetStateOnDevice` 在计算 `ShaderLinkingConfig::requiresSdrBoostConversion @ +0x88` 时先检查该位：
+
+```cpp
+bool mayElideSdrBoostConversion =
+    renderTargetInfo.sdrBoost != 0.0f &&
+    !HasFlag(techniqueFlags, DisallowSdrBoostConversionElision) &&
+    AllSurfaceColorSpacesAllowElision();
+
+config.requiresSdrBoostConversion = !mayElideSdrBoostConversion;
+config.sdrBoostEnabled = renderTargetInfo.sdrBoost != 0.0f;
+```
+
+末端 `BoostSDRLuminance` 路径要求 `requiresSdrBoostConversion && sdrBoostEnabled`。因此 `0x20` 描述的是该 effect chain 是否禁止“当前 target 已有 boost 状态，所以可省略 conversion”的优化，不是 alpha-preservation flag。producer 集合包含 `LuminanceToAlpha`、lighting 和多数 generated color effects，却不包含 `OpacityEffect`，也与这个解释一致。
+
+整体上六个 bit 分属三层：
 
 ```text
 0x1
@@ -4452,6 +5899,9 @@ if ((HasFlag(techniqueFlags, ConditionalAuxiliaryBinding) &&
 
 0x2 / 0x4
   technique 执行前追加 auxiliary GPU bindings
+
+0x10 / 0x20
+  改变 sampler constants 与末端 SDR boost conversion 判定
 ```
 
 ## SurfaceDescription 与 physical surface 去重
@@ -5743,6 +7193,70 @@ linked bytecode 与 device 无关，`ID3D11PixelShader` 与 device 绑定。devi
 
 animated property value 不在 cache key 中。同一 factory 的多个 brush instances 可以复用同一个 linked shader；每个 `EffectInstance` 保留自己的 CPU constant-buffer bytes，DWM 再为对应 technique/device 上传当前值。
 
+## 统一失效模型：一次变化到底会重做哪一层
+
+“effect 更新了”不足以判断成本。内部至少有六个彼此独立的工作层次：
+
+```cpp
+enum class EffectWorkLayer // 本文归纳名称，不是原始 enum
+{
+    CompileFactoryTemplate, // description -> flattened graph/library/metadata
+    RebuildBrushGraph,      // instance sources -> CBrushRenderingGraph
+    LinkPixelShader,        // bodies + ShaderLinkingConfig -> linked bytecode
+    CreateDeviceShader,     // linked bytecode -> device-bound ID3D11PixelShader
+    UploadConstants,        // EffectInstance bytes -> technique GPU cbuffer
+    RedrawIntermediate      // off-screen/mask/blur/BVI result realization
+};
+```
+
+常见变化的实际边界如下。表中的“可能”表示取决于该变化是否改变 surface 数量、format、color space、bounds、cache flags 或 specialized technique 参数，而不是随机行为。
+
+| 变化 | factory / brush graph | link / device shader | constant buffer | intermediate / mask / result |
+|---|---|---|---|---|
+| animated scalar/color | factory 不变；通常不重建 graph | 通常命中原 linked shader | change stamp 后上传相关 subgraph | 纯 pointwise effect 通常无需额外 surface；specialized effect 仍须重画结果 |
+| animated transform/crop/extent | factory 不变；topology 通常不变，但重新算 bounds | 通常不 relink | 上传；transform 还可能进入专用 state | target bounds、clip 或 cache compatibility 改变时重建/重画 |
+| animated blur radius | factory 不变 | tap-count/config 相同时可复用 linked shader；跨 bucket 可能换 technique shader | blur 参数由 specialized path 读取 | effective sigma 改变通常重建 `CBlurRenderingGraph` 并重画 blur |
+| source brush identity | factory template 不变；effect-brush graph/input binding 可能重建 | surface topology/config 改变时重新 lookup/link | property cbuffer 无直接变化 | source realization 和依赖 intermediate 失效 |
+| source content 改变 | topology 通常不变 | 通常不 relink | 无 | notifier 使依赖 draw list、intermediate、mask 或 cached image 失效 |
+| mask brush / caster geometry 改变 | shadow resource topology 通常不变 | shadow technique 通常不 relink | 通常无 | `CShadowMaskProducer` realization、blur 和最终 shadow 重画 |
+| target format / color space / SDR boost | description 和 topology 不变 | `ShaderLinkingConfig` / cache key 可能变化；device object 按 key/device 获取 | 通常无 | target-domain 不兼容的 cached realization 不能复用 |
+| transform scale / axis alignment 改变 | graph topology 不变 | 通常不 relink | transform state 更新 | `CDrawListCache` flags、pixel bounds、intermediate size 或 BVI validity 可能失效 |
+| backdrop generation / source rect 改变 | graph topology 不变 | 通常不 relink | 无 | BVI cached target 与 reverse-linked blurred-backdrop result 失效 |
+| device loss / device replacement | compiled template 与 linked bytecode 可保留 | 不必重新 link；为新 device 重建 pixel shader | 为新 device 重建/upload GPU buffer | 所有 device-bound texture/target realizations 重建 |
+
+可把最常见的动态属性 fast path 写成：
+
+```cpp
+void OnAnimatedPropertyChanged(EffectInstance* instance, PropertyId id, Value value)
+{
+    MapAndWrite(instance->cpuConstantBuffer, id, value);
+    ++instance->subgraphChangeStamp[SubgraphOf(id)];
+
+    if (PropertyAffectsBounds(id))
+        RecalculateForwardAndReverseBounds();
+
+    if (SpecializedExecutorConsumes(id))
+        InvalidateSpecializedGraphOrResult();
+
+    // 不修改 description、ShaderLinkingBody 或 ShaderLinkingConfig，
+    // 因而普通路径不重新 compile factory，也不重新 LinkShader。
+}
+```
+
+而 source/target 状态变化走的是另一条判断链：
+
+```text
+source identity/content/target-domain change
+  -> brush graph 或 realization dirty
+  -> 重新生成本次 technique 的 SurfaceDescription / ShaderLinkingConfig
+  -> shader-cache lookup
+     -> key 相同：复用 linked bytecode/device shader
+     -> key 不同：LinkShader，或命中另一份已有 variant
+  -> 对失效的 off-screen outputs 执行 redraw
+```
+
+所以性能分析时应分别计数 factory compile、graph rebuild、link、device-object creation、cbuffer upload 和 off-screen draw。只观察其中一个事件，不能推断其余五层也发生或没有发生。
+
 ## shader linking 失败、降级与错误传播
 
 shader 路径没有一个通用的“link 失败就画 transparent black”策略。transparent-black fallback 属于 backdrop input gathering；shader program 失败走的是 HRESULT propagation。唯一确认存在的 link-time feature downgrade 是移除 lighting 后重试。
@@ -5968,6 +7482,7 @@ linkingArgType = 0x0200
 |---|---:|---|
 | named graph inputs | 4 | `AddNamedInput @ 0x180011EB0` 与 blob constructor |
 | physical sampler slots | 4 | DWM `LinkShader` |
+| public factory graph shape | tree；同一 effect object 只能出现一次 | `EnumerateEffectSubgraphs` 的 identity set 与 `Non-tree shaped effect graph.` |
 | flattened subgraphs | 5 | traversal 的 40-byte guard 与 blob count guard |
 | effect nodes | 25 | traversal 的 200-byte guard 与 blob count guard |
 | animatable property paths | 每个 `FlattenedEffectGraph` 375 | 一次 factory 的 9000-byte vector guard；record size `0x18` |
@@ -5976,6 +7491,8 @@ linkingArgType = 0x0200
 | per-subgraph dynamic cbuffer size | 未见 WUCEffectsI 专用数值 guard | `uint32_t` offset；由 HLSL/linker/device 后续约束 |
 | white-noise graph source parameters | 3 | `VisitEffect` 与 `AddNamedInput` 双向检查 |
 | source-flatten topology 中的 sources | 通常 3 | `N + 2 <= 5` |
+| effect-brush runtime inputs | template 设置时固定 | `ProcessSetTemplate` 分配数组；`ProcessSetInput` 只允许 `index < inputCount` |
+| filter/tree effect layer dimension | `min(device limit, 0x4000)` | `PushEffectLayer @ 0x18003FAE0` |
 | shader model | 4.0 family | DWM fragment modules / linker |
 
 ## 如何判断一条输入边最终是什么
@@ -6009,7 +7526,14 @@ flowchart TD
 |---:|---|---|
 | `0x18000BE58` | `Traverser::Traverser` | traversal 总入口、final wrapper、subgraph 建立 |
 | `0x18000CB3C` | `Traverser::EnumerateEffectSubgraphs` | source flattening、wrapper 创建、subgraph 顺序 |
+| `0x1800122E4` | `FlattenedEffectGraph::Finalize` | 最终 subgraph 的 opacity relevance 计算与 named-input 标记 |
+| `0x1800121A0` | `FlattenedEffectGraph::DoOpaqueInputsProduceOpaqueOutputs` | graph-level whole-input opaque capability |
+| `0x1800121E8` | `FlattenedEffectGraph::DoesNodeHaveOpacityRelevance` | relation 0/1/2 的 none/any/all 递归判断 |
+| `0x1800130B0` | `FlattenedEffectGraph::IsInputOpacityRelevant` | DWM 查询某个 named input 是否参与 opaque proof |
+| `0x180013304` | `FlattenedEffectGraph::SetNodeOpacityRelevance` | relevant named inputs 的反向传播 |
 | `0x18000D0C0` | `Traverser::FindSourceFlatteningEffect` | source identity 匹配 |
+| `0x180017C48` | `EffectType::FromGuid` | GUID 到 31 项 native EffectType table |
+| `0x180012C9C` | `EffectNode::Initialize` | input/property storage 与 EffectType 虚表校验 |
 | `0x18000D630` | `Traverser::VisitEffect` | node 创建、source count、属性、node limit |
 | `0x18000DB78` | `Traverser::VisitEffectInputs` | input 类型和索引 |
 | `0x18000D244` | `Traverser::VisitAnimatableProperty` | `EffectName.PropertyName` 验证与 animation descriptor |
@@ -6017,6 +7541,8 @@ flowchart TD
 | `0x18000FD00` | `FlattenedEffectGraph` constructor | named-input 和反序列化限制 |
 | `0x180012410` | `FlattenedEffectGraph::GetAnimatablePropertyDesc` | expression type 与默认值 reverse mapping |
 | `0x18001572C` | `EffectGenerator::Compile` | subgraph 到 compiled-subgraph |
+| `0x180016660` | `EffectGenerator::EmitNode` | EffectType capability slots 到 flags `0x2/0x4/0x10/0x20` |
+| `0x1800168E8` | `EffectGenerator::EmitShaderSourceForSubgraph` | final node、flag `0x8` 与 generated return body |
 | `0x180015454` | `EffectGenerator::BuildCompiledEffectSubgraph` | library compile、PSBody export 验证与 compile failure |
 | `0x180015140` | `EffectGenerator::AllocateConstantBufferField` | alignment、size 和 HLSL `packoffset` |
 | `0x180015C80` | `EffectGenerator::DeclareDynamicShaderVariable` | cbuffer field 与 updater record |
@@ -6046,21 +7572,79 @@ flowchart TD
 | `0x18001E040` | `EffectType::GetBounds` | 默认 input union |
 | `0x18001E3D0` | `BorderEffectType::CalcInversedWorldInputBoundsFromVisibleWorldOutputBounds` | infinite reverse bounds |
 | `0x18001E550` | `BorderEffectType::GetBounds` | infinite forward bounds |
+| `0x18000A910` | `BlendEffectType::GetEffectOpacityRelation` | 固定 AnyRelevantInput relation |
+| `0x18001EDA0` | `CompositeEffectType::GetEffectOpacityRelation` | composite mode 到 opacity relation |
 | `0x18001DB00` | `GaussianBlurEffectType::GenerateCode` | pixel passthrough；blur 参数交给 specialized graph path |
 | `0x180020350` | `ClampFloatProperty<0,250>` | `BlurAmount` 静态验证 / 动态 clamp |
 | `0x180020380` | `GaussianBlurEffectType::CalcInversedWorldInputBoundsFromVisibleWorldOutputBounds` | `3 * BlurAmount` 反向 bounds propagation |
 | `0x180020490` | `GaussianBlurEffectType::GetBounds` | Soft border padding 与 Hard bounds |
 | `0x1800205F0` | `GaussianBlurEffectType::Validate` | BorderMode 0/1 验证 |
 
+### XAML/DWM：element shadow 与 mask
+
+| 函数地址 | 函数 | 关注点 |
+|---:|---|---|
+| `0x18094E830` | `ProjectedShadowManager::UpdateCasterStatus` | element/visual、ThemeShadow mask 与 scene caster 同步 |
+| `0x18094D054` | `ThemeShadowScene::AddNewCaster` | `ElementShadowSource` / visual source 与 mask brush 建立 |
+| `0x18094E020` | `ElementShadowSource::GetVisualNoRef` | UIElement 到专用 shadow composition visual |
+| `0x1800D2B50` | `CDropShadow::ProcessSetMask` | mask resource-table lookup、notifier 替换与 invalidation |
+| `0x1800C93B8` | `CProjectedShadowCaster::ProcessSetMask` | caster mask command 到 DWM `CBrush` resource |
+| `0x1800EC294` | `CProjectedShadowReceiver::ProcessSetMask` | receiver mask command 到 DWM `CBrush` resource |
+| `0x1800D338C` | `CDropShadow::UpdateShadowIntermediates` | 显式 mask / visual-content source policy 与 per-visual cache |
+| `0x1800D1FE0` | `CDropShadow::GenerateDrawList` | blurred mask、color、offset 与 occlusion 合成 |
+| `0x1800C9634` | `CProjectedShadowCaster::UpdateMaskIntermediate` | caster visual geometry + mask brush 到 cached mask |
+| `0x1800EBDBC` | `CProjectedShadowReceiver::GetReceiverMaskInputBrush` | receiver mask/default coverage realization |
+| `0x1801773A0` | `CShadowMaskProducer::Create` | cached mask producer 创建与首份 realization |
+| `0x180177AC4` | `ShadowHelpers::GenerateMaskIntermediate` | off-screen layer、shape/bounds clip 与 brush rasterization |
+| `0x1800B5980` | `CProjectedShadow::GenerateDrawList` | blurred caster mask + receiver mask 的最终 rendering effect |
+| `0x1800F8C34` | `CProjectedShadowScene::PrepareShadows` | caster/receiver pair 准备、projection 与 draw ordering |
+| `0x1801786B8` | `ShadowHelpers::GetProjectionOntoVisualMatrix` | light 到 receiver visual plane 的 projection matrix |
+| `0x1800EC7D0` | `CProjectedShadowApproxBlurGraphBuilder::Build` | approximate-blur rendering graph |
+| `0x18003D754` | `CDrawingContext::PreSubgraph` | 普通 visual 前置状态与 drawOrder=1 projected shadow 插入点 |
+| `0x18003D4D8` | `CDrawingContext::PostSubgraph` | drawOrder=0 projected shadow 与状态回收 |
+| `0x1800C1AB4` | `CVisual::RenderProjectedShadows` | receiver draw order 到 shadow scene draw |
+
 ### DWM：图是怎样变成 shader 的
 
 | 函数地址 | 函数 | 关注点 |
 |---:|---|---|
-| `0x1800CF738` | `CCompiledEffectTemplate::ProcessUpdate` | description 反序列化与异步编译启动 |
+| `0x1800CF738` | `CCompiledEffectTemplate::ProcessUpdate` | type-157 shared-section slice、反序列化与异步编译启动 |
 | `0x18002A36C` | `CEffectCompilationService::BeginCompile` | task 去重、cache 和 threadpool work |
 | `0x180055260` | `CEffectCompilationTask::Compile_WorkerThread` | compile HRESULT、restricted error 与 task state 写入 |
 | `0x1800554A8` | `CEffectCompilationTask::Complete_RenderThread` | success/failure result 通知所有 targets |
 | `0x1800CF6BC` | `CCompiledEffectTemplate::GetCompiledEffectNoRef` | completed task 同步与 result 获取 |
+| `0x1800D4E38` | `CEffectBrush::ProcessSetTemplate` | template resource、固定 input count 与 instance 初始化 |
+| `0x1800D4C50` | `CEffectBrush::ProcessSetInput` | indexed source resource、type validation 与 notifier 替换 |
+| `0x1800D4D58` | `CEffectBrush::ProcessSetPropertySet` | `CPropertySet` resource 与 brush callback 安装 |
+| `0x1800D4AF0` | `CEffectBrush::OnPropertyValueChanged` | property update 到 `IEffectInstance` 和 invalidation reason |
+| `0x1800D5038` | `CEffectBrush::ReleaseResources` | graph/property/input/instance/template 的释放顺序 |
+| `0x1800D4084` | `CEffectBrush::CalculateIsOpaque` | compiled opacity relevance 与 relevant-input opaque proof |
+| `0x180120C10` | `CResourceFactory::Create` | `CEffectBrush` 完整布局、2-slot inline input buffer 与默认字段 |
+| `0x1800251A4` | `CResource::RegisterNotifier` | listener 插入 dependency、dependency AddRef 与 notifier 强边 |
+| `0x180025540` | `CResource::UnRegisterNotifierInternal` | listener 移除成功后 Release dependency |
+| `0x180024F20` | `CResource::NotifyOnChanged` | notification state、resource gate 与 listener iteration |
+| `0x1800B16F0` | `CContent::NotifyListenerOfChange` | visual listener 的 reason 0→额外 reason 5 pre-change |
+| `0x1800B03B0` | `CBrush::Draw` | `usesBrushRenderingGraph` 与 lazy `EnsureBrushGraph` |
+| `0x180015F80` | `CBrush::HrFindInterface` | `IBrushChangeNotification` IID 到 `CBrush +0x48` marker subobject |
+| `0x1800B08C0` | `CBrush::NotifyOnChanged` | `activeChangeSource` 重入 guard、graph dispose/adjust 与通知传播 |
+| `0x1800E83BC` | `CBrushRenderingGraph::AdjustNotification` | brush marker / effect-change descriptor 识别与 reason 1→6 升级 |
+| `0x1800E8140` | `CBrushRenderingGraph` destructor | owned techniques、owned/borrowed shader cache 与 inline arrays |
+| `0x1800E8B5C` | `CBrushRenderingGraph::Dispose` | 清除 borrowed graph-input view 并封死继续执行 |
+| `0x180110550` | `CBrushRenderingGraphBuilder::Build` | `0xD8` graph 初始化、4-input/1-technique inline storage |
+| `0x180111034` | `CBrushRenderingGraphBuilder::EnsureShaderCache` | 复用 fragment cache 或创建 graph-owned cache |
+| `0x1801107A8` | `CBrushRenderingGraphBuilder::CheckBackdropInputs` | backdrop/type capability 汇总与首个 backdrop input |
+| `0x1800D4FE0` | `CEffectPropertyChangeNotification::QueryInterface` | 栈上 effect-change descriptor 的 IID 与 `IUnknown` 合同 |
+| `0x1800D4380` | `CEffectPropertyChangeNotification::GetChange` | 返回 `IEffectInstance*` 与 changed node index |
+| `0x18013A638` | `DynArrayImpl::Grow` | initial buffer 到 heap 的切换，以及 heap realloc |
+| `0x18013A80C` | `DynArrayImpl::ShrinkToSize` | count 回落后复制回 initial buffer |
+| `0x180124160` | `CLocalComposition::ProcessMessage` | effect-brush command size、target resource 与 referenced resource 预校验 |
+| `0x18004014C` | `CDrawingContext::PushEffects` | clip/opacity/effect/resample/color-space 的 layer 决策入口 |
+| `0x180040AA8` | `CDrawingContext::PushLocalSpaceClipAndAlphaInternal` | direct effective alpha 与 D2D isolation layer 分支 |
+| `0x18003FAE0` | `CDrawingContext::PushEffectLayer` | filter/tree effect layer、bounds 与 texture-size guard |
+| `0x18003EF2C` | `CDrawingContext::PushClipRectForCurrentNode` | rect clip 到 local-space clip/alpha path |
+| `0x18003F15C` | `CDrawingContext::PushClipShapeForCurrentNode` | shape clip 到 CPU/GPU geometry/layer path |
+| `0x18007C10C` | `CSurfaceShaderComposer::RunShader` | sampler、pixel shader、BlendMode 与 output target 绑定 |
+| `0x180099640` | `CD3DBatchExecutionContext::SetBlendMode` | blend-class transition flush 与 OM blend-state 设置 |
 | `0x1800E8668` | `CBrushRenderingGraph::ConfigureIntermediateFromBackdropInput` | backdrop size/transform/content rect 到 intermediate configuration |
 | `0x1800E8904` | `CBrushRenderingGraph::ConfigureIntermediateFromInput` | 普通 input scale 与 pixel-inflated target configuration |
 | `0x1800E8B8C` | `CBrushRenderingGraph::EnsureIntermediateRendered` | lazy materialization 与 per-walk reuse |
@@ -6098,6 +7682,10 @@ flowchart TD
 | `0x1800AA138` | `PopulateSamplerArguments` | sampler metadata nodes |
 | `0x1800A9C90` | `PerformSample` | 系统 texture sample fragments |
 | `0x1800A82DC` | `ApplyTexcoordExtendMode` | clamp / wrap / mirror 坐标 fragments |
+| `0x1800A2004` | `CDrawListPrimitive::UpdatePremultipliedColor` | straight primitive color、opacity/coverage 与 premultiply |
+| `0x18003F3C0` | `CDrawingContext::PushColorSpaceLayer` | 带目标 color-space 语义的 off-screen layer |
+| `0x18008C980` | `CSurfaceDrawListBrush::IsColorConversionRequired` | source/target color-space conversion 判断 |
+| `0x180099CCC` | `ColorConversion::GetConversionShader` | color-space pair 到 conversion fragment |
 | `0x1800A7940` | `AppendColorModifications` | IgnoreAlpha、SDR unboost、颜色转换 |
 | `0x1800A78B4` | `AppendColorConversion` | descriptor 中的颜色转换 export |
 | `0x1800A9A04` | `LoadShaderBody` | module loading 和 bindings |
@@ -6172,35 +7760,38 @@ flowchart TD
 ## 最终心智图
 
 ```text
-IGraphicsEffect
-  描述逻辑图和 named sources
-        |
-        v
-WUCEffectsI Traverser
-  识别 EffectType、nodes、subgraphs、flatten wrappers
-        |
-        v
-FlattenedEffectGraph / ICompiledEffect
-  描述 subgraph inputs、flags、surface metadata、shader bodies
-        |
-        v
-DWM BrushRenderingGraph
-  把输入变成 fragment dependency、brush input 或 intermediate surface
-        |
-        v
-RenderingTechniqueFragment
-  收集 SurfaceDescription，重映射 logical arguments
-        |
-        v
-RenderingTechnique
-  确定一次 pass、一个 profile domain 和一条 body chain
-        |
-        v
-LinkShader
-  sampler discovery -> sampler helpers -> dependency bodies -> main body -> post effects
-        |
-        v
-CLinkedShader / ID3D11PixelShader
+factory lane                              brush-instance lane
+------------                              -------------------
+IGraphicsEffect tree                      CompositionEffectBrush
+  |                                        | template/input/property resource IDs
+  v                                        v
+WUCEffectsI Traverser                    DWM CEffectBrush
+  EffectType / nodes / subgraphs           CPropertySet + inputs[] + IEffectInstance
+  |                                        |
+  v                                        |
+FlattenedEffectGraph / ICompiledEffect <---+
+  | compiled template                      |
+  +--------------------+-------------------+
+                       v
+              CBrushRenderingGraph
+                fragment dependency / brush input / intermediate
+                       |
+                       v
+              CRenderingTechnique
+                SurfaceDescription + logical remapping + body chain
+                       |
+                       v
+                   LinkShader
+                sampler helpers + bodies + color/alpha fragments
+                       |
+                       v
+              CLinkedShader / ID3D11PixelShader
+                       |
+                       v
+        visual clip/effective alpha/effect layer
+                       |
+                       v
+                BlendMode output merge
 ```
 
 animated property 走旁路更新同一个 technique 的数据：
@@ -6231,5 +7822,8 @@ CRenderingTechnique::UpdateConstantBuffers
 - 为什么 `samplerDataExt` 不能单独创建 sampler？
 - 为什么 multi-texture 的上限不是 D3D11 的 SRV 上限？
 - 为什么动画属性每帧变化却不触发 shader relink？
+- 为什么同一个 effect object 不能被两个 parents 共享？
+- 为什么 visual clip/opacity 不能直接作为 shader 的 mask texture？
+- 为什么 shader-side `minBlend` 不等于最终 D3D blend state？
 
-答案都来自 effect graph、technique boundary、physical surface collection 和 shader-linking semantic 之间的映射。
+答案都来自 factory tree、resource graph、technique boundary、physical surface collection、visual coverage state 和 shader-linking semantic 之间的映射。
