@@ -83,7 +83,7 @@ rounded rect 在这里不只是 clip mask。它同时驱动折射衰减、色散
 >
 > WinUI 3 部分包含大量逆向和 hook 实验，属于研究代码，不是稳定 API 用法。基于 WinAppSDK v2.2.0 x64 测试。
 
-WinUI 3 版本不是 WinUI 2 的简单移植。得益于 WinUI 3 的 Lifted Compositor 架构，此版本可以用于验证基于 hook 的自定义 effect shader 路线：**尽量不在 app 侧自绘 intermediate surface，而是把自定义 effect 伪装成 composition 可接受的 effect graph，并让 DWM/WUCEffectsI 编译和执行它。**
+WinUI 3 版本不是 WinUI 2 的简单移植。得益于 WinUI 3 的 Lifted Compositor 架构，此版本可以用于验证基于 hook 的自定义 effect shader 路线：**尽量不在 app 侧自绘 intermediate surface，而是把自定义 effect 伪装成 composition 可接受的 effect graph，并让 Windows App SDK 随附的 WUCEffectsI / DWM 编译和执行它。这里的 DWM 指 Lifted Compositor 中的 `dwmcorei.dll`，不是桌面会话中的系统 `dwm.exe`。**
 
 当前 UI 使用 XAML `Border.Background` 挂载自定义 `XamlCompositionBrushBase`，再把 `CompositionBrush` 设置为普通 solid / gradient / blur / invert / liquid glass effect brush。演示面板、动态 XAML 元素、背景图片和可拖拽 resize 的 glass rect 都用于观察 backdrop sampling 行为。
 
@@ -117,7 +117,11 @@ WinUI 3 的核心实验代码在：
 - 在运行时参与或绕过 WUCEffectsI / DWM 对 effect type、compiled effect、subgraph、constant buffer 和 shader linking body 的常规假设。
 - 让自定义 shader 能以 DWM custom sampler 的形态拿到 `uv`、`samplerDataExt` 和 `samplerData`。
 
-这里的“hook”不是为了把自定义逻辑绕回 app 自绘路径，而是为了让 WinUI 3 的 `CompositionEffectBrush` 继续走系统 composition brush 路径，同时让未公开的 custom effect 形状被接受。
+这里的“hook”不是为了把自定义逻辑绕回 app 自绘路径，也不是在 hook 系统 `dwm.exe`。它是为了让 WinUI 3 的 `CompositionEffectBrush` 继续走 Windows App SDK Lifted Compositor 的 brush 路径，同时让未公开的 custom effect 形状被接受。
+
+完整的 WUCEffectsI graph traversal、DWM rendering graph、technique/fragment、shader linking ABI、custom sampler 和纹理输入限制见：
+
+- [docs/dwm-shader-linking.md](./docs/dwm-shader-linking.md)
 
 ### WinUI 3 effect 文件
 

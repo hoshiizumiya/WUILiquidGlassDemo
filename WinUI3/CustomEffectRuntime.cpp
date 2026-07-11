@@ -7,6 +7,13 @@ using namespace Windows::Graphics::Effects;
 
 namespace
 {
+    // TODO: Re-audit and rename the graph-layer terminology in this runtime.
+    // In particular, keep EffectNode indices, CompiledEffectSubgraph indices,
+    // shader-linking main/dependency bodies, CRenderingTechnique boundaries, and
+    // intermediate materialization decisions distinct. Current names such as
+    // mainSubgraph rely on the synthetic topology making the custom node index and
+    // custom-effect subgraph index coincide; that is not a general graph invariant.
+
     // This file is a deliberately narrow compatibility layer for one WinAppSDK /
     // Windows composition build. The public WinRT object returned by CreateEffect()
     // looks like a normal IGraphicsEffect, but wuceffectsi/dwmcorei only accept a
