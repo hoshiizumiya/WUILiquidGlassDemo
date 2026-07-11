@@ -13,6 +13,7 @@
 - sampler discovery、`samplerData`、`samplerDataExt`
 - animated property、constant-buffer updater 和 change stamp
 - forward bounds、reverse input bounds 和 CPU-side culling contract
+- blur graph、BVI、backdrop result cache 和 cached-target refresh throttle
 - visual traversal、alpha/color contract、shadow 与 mask realization
 - composition command、resource table 与 notifier-driven invalidation
 - shader module loading、fragment linking、profile 和 shader cache
@@ -527,6 +528,10 @@ DWM 使用的不是常规 `D3DCompile(entryPoint, ps_4_0)` 路径，而是：
 | `ShaderLinkingBody` | DWM | 一个 library function、参数语义、bytecode 和 profile 的描述 |
 | `ShaderLinkingConfig` | DWM | surface、sampler、edge mode、颜色处理等 link 配置 |
 | `CLinkedShader` | DWM | 已连接 bytecode、pixel shader 和相关缓存对象 |
+| `CBlurRenderingGraph` | DWM | Gaussian blur 的 prescale、axis passes、callbacks 和 technique topology |
+| `CBackdropVisualImage` | DWM | 某个 visual/path 的 backdrop capture producer，并按 target domain 保存 realizations |
+| `CCachedVisualImage::CCachedTarget` | DWM | 一份 target-domain realization，保存 QPC/generation stamps 与 dirty state |
+| `CBlurredBackdropCache` | DWM | 以 BVI/target realization 为依赖保存已经完成的 blurred `EffectInput` |
 | `CDropShadow` | DWM | 单 visual/content mask 的显式 offset/blur/color shadow |
 | `CProjectedShadowScene` | DWM | light、casters、receivers 与投影绘制顺序的 scene-level shadow 系统 |
 | `CShadowMaskProducer` | DWM | 把 brush + geometry/bounds clip rasterize 为可缓存 alpha mask realization |
@@ -7506,6 +7511,29 @@ struct CCustomKernelEffect
 
 因此观察性能时，不能只看到“graph 被重建”就推断发生了 shader compilation，也不能看到“shader cache hit”就推断没有 blur draw；三层 cache 分别消除 topology 构造、shader link/device creation 和实际 blur rendering 三种不同成本。
 
+backdrop result cache 还有一个独立的进程启动期开关。`_dynamic_initializer_for__CCommonRegistryData::EnableBackdropBlurCaching__ @ 0x180007010` 读取：
+
+```text
+HKLM\Software\Microsoft\WinUI\RenderingEngine
+    EnableBackdropBlurCaching
+```
+
+未配置时默认启用；显式写入 `0` 才禁用。这个开关只控制 `ExecuteBlur @ 0x18017BB70` 成功绘制后是否调用 `UpdateCachedBlur` 写入新的 blurred result，不关闭 BVI、Gaussian blur graph、graph cache 或 linked-shader cache：
+
+```cpp
+if (backdropBvi != nullptr &&
+    CCommonRegistryData::EnableBackdropBlurCaching &&
+    backdropBvi->IsValid())
+{
+    CCachedTarget* target = backdropBvi->FindExistingCachedTarget(targetInfo);
+
+    if (target != nullptr && target->IsValid() && !target->dirty)
+        blurGraph->backdropResultCache.UpdateCachedBlur(backdropBvi, target, output);
+}
+```
+
+`LookupCachedBlur` 位于这个写入 gate 之前。由于该 registry 值在进程启动时初始化，关闭它的正常效果是本进程不再产生可供后续 lookup 命中的新记录，而不是在每次 lookup 时额外检查一次 bool。
+
 ### BVI：Backdrop Visual Image
 
 前面的 `BVI-UsingCachedBlur` 等字符串中的 BVI 是 `CBackdropVisualImage`，即 Backdrop Visual Image。它不是 blur graph，也不是一张永久保存的 desktop 截图；它是 DWM 为“某个 visual 在某条 visual-tree path 上所看到的背后内容”建立的 `CCachedVisualImage` realization。
@@ -7578,8 +7606,8 @@ struct CBackdropVisualImage : CCachedVisualImage
         CVisual const*,
         CVisualTreePath const>> ancestors;              // +0x888，sizeof = 0x18
 
-    // 以下名称由本文根据初始化、validation 和诊断消费点重建。
-    uint64_t diagnosticEventValue;                      // +0x8A0；当前 build 恒为 0，仅作为诊断事件字段输出
+    // 以下名称由本文根据 producer/consumer 重建。
+    uint64_t lastTouchedCompositionGeneration;          // +0x8A0；CTreeData BVI stale-GC stamp
     bool useCachedTargetInvalidationThrottle;           // +0x8A8
     bool hasEffectInputTransform;                       // +0x8A9
     bool canUseOcclusion;                               // +0x8AA
@@ -7605,7 +7633,191 @@ bool CBackdropVisualImage::CanUseOcclusion() const
 
 这两个名称还直接出现在 `LogEtwEvent @ 0x1800C5DE4` 的诊断格式 `IsValid, CanUseAsEffectInput, CanUseOcclusion` 中。`SetEffectInputParameters @ 0x1800C6340` 在保存新 transform 后设置 `hasEffectInputTransform = true`；root/source rectangle 改变并使 cached targets dirty 时，validation 路径会把它清回 false，直到 render-time 参数重新建立。
 
-`useCachedTargetInvalidationThrottle` 由 `Initialize @ 0x1800C5B40` 根据 backdrop root/source 状态初始化。`ValidateRootAndSourceRectangle` 只有在该位为真时才采用 `m_backdropBlurCachingThrottleQPCTimeDelta`；否则 throttle delta 为 0，并同步当前 composition DPI/scale。这个位不是笼统的 BVI valid/dirty flag。
+`useCachedTargetInvalidationThrottle` 在 `Initialize @ 0x1800C5B40` 中先置 1，再根据 owner/root render state 和 window-background-treatment policy 覆盖。它不是 public property，也不是笼统的 BVI valid/dirty flag。
+
+#### `CTreeData` 中的 BVI stale retention
+
+`BVI +0x8A0` 不是恒为 0 的诊断字段。`CTreeData::SetBackdropVisualImage @ 0x18004A78C` 在按 `CVisualTreePath` 插入或替换 BVI 时，把当前 composition generation 写入该槽。命中已有 path 的 replace 分支写完 stamp 后直接返回；只有追加新 path-specific BVI 时，函数才顺带遍历同一 tree-data 中的 BVI 列表，删除超过 10 generations 没有被重新触达的对象：
+
+```cpp
+void CTreeData::SetBackdropVisualImage(
+    CVisualTreePath const& path,
+    CBackdropVisualImage* value)
+{
+    // helper/container names are reconstructed for this document.
+    if (CBackdropVisualImage** slot = FindBviSlotForPath(path))
+    {
+        ReplaceComPtr(*slot, value);
+        value->lastTouchedCompositionGeneration = CurrentCompositionGeneration();
+        return;
+    }
+
+    backdropVisualImages.push_back(value);
+    value->lastTouchedCompositionGeneration = CurrentCompositionGeneration();
+
+    uint64_t now = CurrentCompositionGeneration();
+
+    for (auto it = backdropVisualImages.begin();
+         it != backdropVisualImages.end(); )
+    {
+        CBackdropVisualImage* candidate = it->get();
+
+        if (now - candidate->lastTouchedCompositionGeneration <= 10)
+        {
+            ++it;
+            continue;
+        }
+
+        candidate->LogEtwEvent("BVI-StaleDelete");
+        it = backdropVisualImages.erase(it);
+    }
+}
+```
+
+这是一层 BVI-object lifetime retention，不是 `CCachedTarget::IsValid` 的 `< 5` generation window：前者决定一个 path-specific BVI object 何时从 `CTreeData` 移除，后者决定该 BVI 内某个 target-domain realization 是否仍有效。两者也都独立于 25 ms QPC throttle。
+
+### Backdrop blur throttle：节流的是 cached-target invalidation
+
+throttle 的配置入口位于 `CCommonRegistryData::InitializeDWMKeysFromRegistry @ 0x18000F2C4`：
+
+```text
+HKLM\Software\Microsoft\WinUI\RenderingEngine
+    BackdropBlurCachingThrottleMs
+```
+
+当前版本的初始化规则为：
+
+```cpp
+uint32_t throttleMs;
+
+if (ReadRegistryDword(L"BackdropBlurCachingThrottleMs", &value))
+    throttleMs = min(value, 1000u);
+else
+    throttleMs = 25;
+
+CCommonRegistryData::m_backdropBlurCachingThrottleQPCTimeDelta =
+    g_qpcFrequency * throttleMs / 1000;
+```
+
+所以默认 interval 是 25 ms，registry override 允许 `0..1000` ms；`0` 表示 QPC delta 为 0，而不是关闭 backdrop blur。默认值从时间上相当于最多约 40 次/秒的 eligible cached-target refresh，但它不是严格的 40 FPS scheduler：结构变化可以绕过 throttle，实际更新还受 frame、dirty region、target validity 和 render demand 约束。
+
+`CCachedVisualImage::CCachedTarget::Update @ 0x1800B34DC` 在一次 realization 成功完成后写入：
+
+```cpp
+struct CCachedVisualImage::CCachedTarget // partial；字段名为本文重建名称
+{
+    /* +0x00 */ CCachedVisualImage* owner;
+    /* +0x28 */ uint64_t lastUpdateQpc;
+    /* +0x30 */ uint64_t lastCompositionGeneration;
+    /* +0x38 */ bool dirty;
+};
+```
+
+`CCachedVisualImage::CCachedTarget::IsValid @ 0x1800B2D44` 还包含一个独立的 generation window。底层 bitmap/resource 的基础状态查询失败时 target 立即无效；若当前资源不要求 generation validation，则基础状态成功已经足够；只有要求该检查的资源才应用 `< 5` 条件。下面的 vtable method 名称为本文重建名称：
+
+```cpp
+bool CCachedVisualImage::CCachedTarget::IsValid() const
+{
+    if (FAILED(bitmapResource->ValidateBasicState()))
+        return false;
+
+    auto* realization = bitmapResource->GetRealizationNoRef();
+
+    if (!realization->RequiresGenerationValidation()) // 本文重建名称
+        return true;
+
+    return currentCompositionGeneration - lastCompositionGeneration < 5;
+}
+```
+
+因此 `+0x30` 不是 throttle timestamp；QPC interval 只读取 `+0x28`。generation window 决定 target 是否还可参加 cache/throttle 判断，时间窗口决定一个仍 valid 的 target 何时被标脏。超过 generation window 的 target 会在 validation loop 中直接从 `cachedTargets` 删除，不等待 25 ms。
+
+真正消费 interval 的是 `CBackdropVisualImage::ValidateRootAndSourceRectangle @ 0x1800C6874`。它有两类完全不同的失效。下面只保留 cached-target invalidation 决策；原函数在这些分支之外还会更新 effective content rect、scale/texture-limit state、transform 和诊断事件，因此这里的 `FinishCommonValidation` 不代表原始符号中存在同名 label：
+
+```cpp
+HRESULT CBackdropVisualImage::ValidateRootAndSourceRectangle(
+    CVisual* root,
+    RectF const& requiredBounds,
+    bool forceUpdate,
+    bool* realizationChanged)
+{
+    bool structuralChange =
+        root != currentRoot ||
+        requiredBoundsEscapesCurrentSourceRect ||
+        maxSupportedTextureSizeDecreased;
+
+    if (structuralChange)
+    {
+        SetRootAndSourceRectangle(root, requiredBounds);
+
+        // root/source geometry 改变必须立即丢弃旧 capture；不走时间窗口。
+        MarkAllTargetsDirty();
+        hasEffectInputTransform = false;
+
+        if (realizationChanged != nullptr)
+            *realizationChanged = true;
+
+        goto FinishCommonValidation;
+    }
+
+    if (!forceUpdate)
+        goto FinishCommonValidation;
+
+    uint64_t delta = useCachedTargetInvalidationThrottle
+        ? CCommonRegistryData::m_backdropBlurCachingThrottleQPCTimeDelta
+        : 0;
+
+    uint64_t now = QueryPerformanceCounter();
+
+    for (auto it = cachedTargets.begin(); it != cachedTargets.end(); )
+    {
+        CCachedTarget* target = it->get();
+
+        if (!target->IsValid())
+        {
+            it = cachedTargets.erase(it);
+            continue;
+        }
+
+        if (now - target->lastUpdateQpc > delta)
+        {
+            if (!target->dirty)
+            {
+                target->owner->OnCachedTargetInvalidated(target);
+                target->dirty = true;
+            }
+
+            if (realizationChanged != nullptr)
+                *realizationChanged = true;
+        }
+
+        ++it;
+    }
+
+FinishCommonValidation:
+    return FinishBoundsTransformAndDiagnostics(); // 本文概念合并名
+}
+```
+
+这里使用严格的 `elapsed > delta`。`useCachedTargetInvalidationThrottle == false` 时 delta 为 0，普通 `forceUpdate` 基本不再被时间窗口延后；`ValidateRootAndSourceRectangle` 还会在该 bool 为 false 时从当前 composition state 同步 realization/content scale。root/source rect 或 texture limit 变化则直接调用 `MarkAllTargetsDirty @ 0x1800B2DCC`，与 interval 无关。
+
+`owner->OnCachedTargetInvalidated` 对 BVI 实际落到 thunk `CBackdropVisualImage::OnCachedTargetInvalidated @ 0x1800C62C0`，再调用 `InvalidateBlurCache` 删除引用该 target 的 blurred results。因此 throttle 的实际效果链是：
+
+```text
+backdrop content 请求更新
+  -> 尚未超过 target.lastUpdateQpc + throttle delta
+     -> target 暂时保持 clean
+     -> LookupCachedBlur 仍可能命中旧 blurred EffectInput
+
+  -> 超过 interval
+     -> target dirty + OnCachedTargetInvalidated(target)
+     -> 删除该 (BVI, target) 的 CachedBlur
+     -> 后续 capture / ExecuteBlur 重新生成结果
+```
+
+因此它可以描述为“backdrop blur refresh throttle”，但不能描述成 `ExecuteBlur` 的调用频率限制、per-effect blur budget 或 animated `BlurAmount` throttle。
+
+同一 interval 还被 `CPreComputeContext::ProcessPostSubgraphWindowBackgroundTreatment @ 0x1800228F8` 消费。window-background-treatment 的 cached producer entry 在 `+0x08` 保存独立 QPC stamp；启用其 throttle policy 时，只有 `now - stamp >= delta` 才把该槽清零并允许 entry 进入下一轮更新。`lastUpdateQpc` 只是这段逻辑的本文重建名称。由此可见该配置属于整个 backdrop caching path，而不是 `CBlurredBackdropCache` 的私有计时器。
 
 ### BVI 怎样变成 EffectInput
 
@@ -7654,6 +7866,40 @@ bool IsValid() const
 
 `CDrawingContext::ValidateBVIEffectInputForRender @ 0x180044348` 会在 render 前结合 current world transform、world-space clipped bounds、visual-tree path、root/source rectangle、max texture size 和当前 `RenderTargetInfo` 验证或更新 BVI。root/source rect 或 device limit 改变时，`ValidateRootAndSourceRectangle @ 0x1800C6874` 会重算 realization，并把已有 cached targets 标脏。
 
+这个函数还有一条容易漏掉的 nested-backdrop fast path。若当前 drawing context 已经处于嵌套 backdrop walk、BVI 仍有效且 `hasEffectInputTransform` 已建立，它不会递归执行完整的 world-transform、bounds、`CreateOrUpdateBVI` 和 transform validation，只检查当前 target-domain 下是否已有 valid、clean cached target。伪代码中的 `isNestedBackdropWalk` 是本文对 `CDrawingContext` 状态组合的重建名称：
+
+```cpp
+if (isNestedBackdropWalk &&
+    bvi != nullptr &&
+    bvi->IsValid() &&
+    bvi->hasEffectInputTransform)
+{
+    bool invalidated = false;
+
+    if (cacheInvalidated != nullptr)
+    {
+        CCachedTarget* target =
+            bvi->FindExistingCachedTarget(CurrentRenderTargetInfo());
+
+        invalidated =
+            target == nullptr ||
+            !target->IsValid() ||
+            target->dirty;
+
+        *cacheInvalidated = invalidated;
+    }
+
+    LogEtw(
+        invalidated
+            ? "BVI-SkipValidationInNestedBackdropWalk-InvalidatedCache"
+            : "BVI-SkipValidationInNestedBackdropWalk-DidNotInvalidateCache");
+
+    return S_OK;
+}
+```
+
+这个 bypass 避免在 capture backdrop 的内部 walk 中再次扩张或更新同一个 BVI。它不是 cache hit 的充分条件：target 缺失、无效或 dirty 时，调用方仍会看到 `cacheInvalidated = true`。普通非嵌套路径则记录 `BVI-Validate-InvalidatedCache` / `BVI-Validate-DidNotInvalidateCache`，并继续执行完整 validation。
+
 ### BVI 与 blurred-backdrop cache 如何互相失效
 
 `CBlurredBackdropCache` 的每条记录是 0x80 bytes：
@@ -7701,7 +7947,20 @@ void CBackdropVisualImage::InvalidateBlurCache(
 }
 ```
 
-`SetEffectInputParameters @ 0x1800C6340` 比较新的 3x3 matrix 与 `BVI +0x864`；任一分量变化超过约 `8.1380211e-5` 时，它会更新 transform，并对当前 BVI 的每个 cached target 调用 `InvalidateBlurCache`。cached target 自身被 invalidated 时也进入同一路径。
+`SetEffectInputParameters @ 0x1800C6340` 比较新的 3x3 matrix 与 `BVI +0x864`；任一分量变化超过约 `8.1380211e-5` 时，它会更新 transform，并对当前 BVI 的每个 cached target 调用 `InvalidateBlurCache`。这条 transform-only 路径删除 blurred results，但不会把底层 BVI target 本身置 dirty：背景 capture 仍可能有效，只是旧 blur output 使用了错误的坐标映射。
+
+cached target 自身失效走另一条更窄的路径：
+
+```cpp
+void CBackdropVisualImage::OnCachedTargetInvalidated(
+    CCachedVisualImage::CCachedTarget const* target)
+{
+    InvalidateBlurCache(target);
+}
+// thunk @ 0x1800C62C0
+```
+
+它只删除 identity 匹配 `(this BVI, target)` 的 `CachedBlur`。若某个 `CBlurredBackdropCache` 已不再保存当前 BVI 的任何记录，`InvalidateBlurCache` 同时从 `BVI +0x858` 的 reverse-link container 移除该 cache pointer；因此 reverse link 不会在最后一条 result 被删除后空挂。
 
 `LookupCachedBlur @ 0x18010243C` 除 BVI identity 外，还验证 cached target 对应的 `RenderTargetInfo`：device/target identity、display compatibility、SDR boost 状态、相关 target flags、texture 是否仍 dirty，以及 boost 数值是否在 epsilon 内一致。命中后复制完整的 0x70-byte `EffectInput`；`ExecuteBlur` 随后还会额外检查调用者给出的 requested output width/height。
 
@@ -8115,7 +8374,9 @@ enum class EffectWorkLayer // 本文归纳名称，不是原始 enum
 | mask brush / caster geometry 改变 | shadow resource topology 通常不变 | shadow technique 通常不 relink | 通常无 | `CShadowMaskProducer` realization、blur 和最终 shadow 重画 |
 | target format / color space / SDR boost | description 和 topology 不变 | `ShaderLinkingConfig` / cache key 可能变化；device object 按 key/device 获取 | 通常无 | target-domain 不兼容的 cached realization 不能复用 |
 | transform scale / axis alignment 改变 | graph topology 不变 | 通常不 relink | transform state 更新 | `CDrawListCache` flags、pixel bounds、intermediate size 或 BVI validity 可能失效 |
-| backdrop generation / source rect 改变 | graph topology 不变 | 通常不 relink | 无 | BVI cached target 与 reverse-linked blurred-backdrop result 失效 |
+| backdrop root / source rect / texture limit 改变 | graph topology 不变 | 通常不 relink | 无 | `MarkAllTargetsDirty` 立即失效 BVI targets，并经 reverse links 删除 blurred results；不经过 throttle |
+| backdrop content 请求刷新 | graph topology 不变 | 通常不 relink | 无 | per-target QPC elapsed 超过 throttle interval 后才 dirty；默认 25 ms，窗口内可继续复用旧 blur result |
+| BVI effect-input transform 改变 | graph topology 不变 | 通常不 relink | 无 | 不 dirty backdrop target；只删除所有引用旧 transform 的 blurred results |
 | device loss / device replacement | compiled template 与 linked bytecode 可保留 | 不必重新 link；为新 device 重建 pixel shader | 为新 device 重建/upload GPU buffer | 所有 device-bound texture/target realizations 重建 |
 
 可把最常见的动态属性 fast path 写成：
@@ -8178,6 +8439,10 @@ source identity/content/target-domain change
 | Profile2 blur rows per kernel chunk | 128 | `CBlurRenderingGraphBuilder::BuildOnePass` |
 | 低 profile blur rows per chunk | 总 rows `<= 4` 时最多 4，否则每 chunk 3 | `BuildOnePass` 的 profile branch |
 | `SymmetricKernelMax` cbuffer allocation | `0x800` bytes | 128 个 16-byte rows；不是普通 effect cbuffer 的统一上限 |
+| backdrop blur result-cache 写入 | 默认启用；registry `0` 可禁用 | `EnableBackdropBlurCaching`；只禁止新 `CachedBlur` 写入，不禁止 blur/BVI/其它 cache |
+| backdrop cached-target invalidation throttle | 默认 25 ms；registry override clamp 到 `0..1000` ms | `BackdropBlurCachingThrottleMs`；per cached target QPC gate，不是 per-effect blur limit |
+| 需要 generation validation 的 BVI cached target | `currentGeneration - targetGeneration < 5` | `CCachedTarget::IsValid @ 0x1800B2D44`；与 25 ms QPC throttle 是独立窗口 |
+| `CTreeData` 中未触达的 path-specific BVI | 新增 BVI 时执行 sweep；generation age `<= 10` 时保留，`> 10` 时删除 | `CTreeData::SetBackdropVisualImage @ 0x18004A78C`；BVI-object lifetime，不是 target validity |
 | completed/dead compilation-task retention | 最多 `0x40` 项 | `CEffectCompilationService::TryAddDeadTask`；cache retention，不是 active factory 数量 |
 | device sampler-state combination table | 64 项 | `filter/addressU/addressV` 各 2-bit-like index；不是 shader sampler-slot 数量 |
 | shader model | 4.0 family | DWM fragment modules / linker |
@@ -8437,6 +8702,13 @@ flowchart TD
 | `0x1801A3848` | `CGaussianKernel::GenerateTaps` | Gaussian pair 合并、bilinear offset 与归一化 |
 | `0x1801A9680` | `CCustomKernelEffect::FillConstantBuffer` | kernel rows 与 Max row-count control |
 | `0x1801A96D0` | `CCustomKernelEffect::GetConstantBufferSize` | 小 kernel 实际大小 / Max 0x800 bytes |
+| `0x180007010` | `EnableBackdropBlurCaching` dynamic initializer | registry cache-write gate；未配置时默认启用 |
+| `0x18000F2C4` | `CCommonRegistryData::InitializeDWMKeysFromRegistry` | `BackdropBlurCachingThrottleMs` 默认 25 ms、1000 ms clamp 与 QPC delta 换算 |
+| `0x1800228F8` | `CPreComputeContext::ProcessPostSubgraphWindowBackgroundTreatment` | window-background-treatment cached producer 对同一 throttle interval 的复用 |
+| `0x18004A78C` | `CTreeData::SetBackdropVisualImage` | path-specific BVI 插入/替换与 `+0x8A0` stamp；新增 path 时执行 `> 10` stale sweep |
+| `0x1800B2D44` | `CCachedVisualImage::CCachedTarget::IsValid` | resource 基础状态与 `< 5` composition-generation validity window |
+| `0x1800B2DCC` | `CCachedVisualImage::MarkAllTargetsDirty` | 结构变化立即 dirty 所有 valid targets，并调用 owner invalidation callback |
+| `0x1800B34DC` | `CCachedVisualImage::CCachedTarget::Update` | realization 完成后清 dirty，写入 `+0x28` QPC 与 `+0x30` composition generation |
 | `0x1800BBBA8` | `CVisual::CreateOrUpdateBVI` | visual/path 对应 BVI 创建与更新 |
 | `0x1800C58AC` | `CBackdropVisualImage::GenerateEffectInput` | BVI realization 到 0x70-byte EffectInput |
 | `0x1800C56A0` | `CBackdropVisualImage::EnsureAncestorList` | 构造 `std::vector<pair<CVisual const*, CVisualTreePath const>>` |
@@ -8445,9 +8717,10 @@ flowchart TD
 | `0x1800C5CFC` | `CBackdropVisualImage::IsValid` | BVI bitmap、rect 与 realization size 有效性 |
 | `0x1800C5D8C` | `CBackdropVisualImage::IsVisualInAncestorList` | visual/path pair 查找 |
 | `0x1800C5DE4` | `CBackdropVisualImage::LogEtwEvent` | `CanUseAsEffectInput` / `CanUseOcclusion` 字段语义 |
+| `0x1800C62C0` | `CBackdropVisualImage::OnCachedTargetInvalidated` | target invalidation callback 到精确 `(BVI, target)` blur-result 删除 |
 | `0x1800C6340` | `CBackdropVisualImage::SetEffectInputParameters` | transform change 与 blur-cache invalidation |
-| `0x1800C6874` | `CBackdropVisualImage::ValidateRootAndSourceRectangle` | backdrop root/source rect 与 cached-target dirtying |
-| `0x180044348` | `CDrawingContext::ValidateBVIEffectInputForRender` | render-time BVI validation |
+| `0x1800C6874` | `CBackdropVisualImage::ValidateRootAndSourceRectangle` | immediate structural dirty 与 per-target QPC-throttled content dirty |
+| `0x180044348` | `CDrawingContext::ValidateBVIEffectInputForRender` | render-time BVI validation 与 nested-backdrop validation bypass |
 | `0x18010243C` | `CBlurredBackdropCache::LookupCachedBlur` | BVI/target/RenderTargetInfo result lookup |
 | `0x180102644` | `CBlurredBackdropCache::UpdateCachedBlur` | CachedBlur 写入与 BVI reverse-link 注册 |
 | `0x180166B18` | `CRenderTargetBitmap::ValidateRenderTargetInfo` | SRV/bitmap 使用前的 adapter/display/capability 验证 |
