@@ -1,4 +1,4 @@
-#include "pch.h"
+﻿#include "pch.h"
 #include "CustomBlurEffect.h"
 #include "CustomInvertEffect.h"
 #include "CustomLiquidGlassEffect.h"
